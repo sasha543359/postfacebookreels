@@ -1,0 +1,7 @@
+bin/
+obj/
+videos/
+*.user
+appsettings.Development.json
+video_history.json
+post_counts.json
