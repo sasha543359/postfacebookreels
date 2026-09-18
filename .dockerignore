@@ -3,3 +3,5 @@ obj/
 videos/
 .git/
 *.md
+docs/
+*.pdf

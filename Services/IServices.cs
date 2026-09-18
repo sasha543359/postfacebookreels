@@ -7,7 +7,7 @@ namespace FacebookReelsPublisher.Services
     /// </summary>
     public interface IFacebookReelsService
     {
-        /// <summary>Пройти весь путь: начать сеанс, залить файл, дождаться обработки, опубликовать.</summary>
+        /// <summary>Пройти весь путь: начать сеанс, залить файл, опубликовать и дождаться выхода ролика.</summary>
         Task<PublishResult> PublishReelAsync(VideoPublishInfo videoInfo);
 
         /// <summary>Статус видео: GET /{video_id}?fields=status.</summary>

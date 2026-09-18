@@ -81,33 +81,29 @@ namespace FacebookReelsPublisher.Services
                     return Fail($"не удалось передать файл: {transferError}", videoId);
                 }
 
-                // Facebook принимает файл и обрабатывает его АСИНХРОННО. Ждать
-                // обязательно: именно на этом этапе приходят внятные отказы вроде
-                // «Resolution too low», а после finish тот же отказ выглядит как
-                // безымянная ошибка 6000.
-                _logger.LogInformation("   ⏳ Ждём, пока Facebook обработает видео...");
+                // До finish ждём только ЗАГРУЗКУ. Обработку Facebook запускает
+                // лишь после finish (проверено вживую: до него processing_phase
+                // стоит в "not_started" сколько угодно). Байтами файл приходит
+                // сразу, а по ссылке Facebook скачивает его сам и не мгновенно.
+                var uploaded = await WaitForUploadAsync(videoId);
 
-                var status = await WaitForProcessingAsync(videoId);
-
-                if (status.IsError)
+                if (uploaded.IsError)
                 {
-                    return Fail($"Facebook забраковал видео: {status.ErrorMessage}", videoId);
+                    return FailWithStatus("Facebook не принял файл", uploaded, videoId);
                 }
 
-                if (!status.IsUploadedAndProcessed)
+                if (!uploaded.IsUploaded)
                 {
-                    // Обработка не доехала за отведённое время, но и ошибки нет.
-                    // Публикуем всё равно: finish нередко дожимает обработку сам,
-                    // а если нет — ролик просто не отметится в истории и уйдёт
-                    // в следующий цикл.
+                    // Файл так и не доехал, но и ошибки нет. Пробуем finish:
+                    // если файла у Facebook нет, он откажет внятно, а ролик не
+                    // отметится в истории и уйдёт в следующий цикл.
                     _logger.LogWarning(
-                        $"   ⚠️  Обработка не завершилась за {_settings.ProcessingTimeoutSeconds}с " +
-                        $"(загрузка: {Or(status.UploadingPhase)}, обработка: {Or(status.ProcessingPhase)}). " +
-                        "Пробуем опубликовать как есть.");
+                        $"   ⚠️  Загрузка не подтвердилась за {_settings.ProcessingTimeoutSeconds}с " +
+                        $"(загрузка: {Or(uploaded.UploadingPhase)}). Пробуем опубликовать как есть.");
                 }
                 else
                 {
-                    _logger.LogInformation("   ✓ Видео обработано");
+                    _logger.LogInformation("   ✓ Файл у Facebook");
                 }
 
                 // ── Обложка (необязательно) ──────────────────────────────────
@@ -129,7 +125,41 @@ namespace FacebookReelsPublisher.Services
                     return Fail($"публикация отклонена: {publishError}", videoId);
                 }
 
-                _logger.LogInformation("   ✅ Reels опубликован");
+                // finish только ставит ролик в очередь: обработка и выход в ленту
+                // идут после него. Отказ по самому файлу (разрешение, длительность)
+                // приходит именно здесь, поэтому успех засчитываем, лишь увидев
+                // исход, — иначе негодный ролик считался бы опубликованным.
+                _logger.LogInformation("   ⏳ Ждём, пока Facebook обработает и выпустит Reels...");
+
+                var final = await WaitForPublishAsync(videoId);
+
+                // Проваливаем только отказ, который сообщил сам Facebook. Такой
+                // отказ окончательный (afterFinish): тот же файл получит тот же
+                // ответ, а повторять — значит заливать его в каждом цикле.
+                if (final.IsError)
+                {
+                    // Окончательный — только отказ по самому файлу, который
+                    // целиком дошёл до Facebook. upload_failed/expired — сбой
+                    // доставки, а не файла: такой ролик уходит в следующий цикл.
+                    var fileRejected = final.IsUploaded
+                        && final.VideoStatus is not ("upload_failed" or "expired");
+
+                    return FailWithStatus("Facebook забраковал видео после публикации", final, videoId, afterFinish: fileRejected);
+                }
+
+                if (final.IsPublished || final.IsReady)
+                {
+                    _logger.LogInformation("   ✅ Reels опубликован");
+                }
+                else
+                {
+                    // finish принят, отказа нет — Facebook не успел или статус не
+                    // читался. Считаем опубликованным: повторная заливка дала бы дубль.
+                    _logger.LogWarning(
+                        $"   ⚠️  Facebook принял Reels, но выход ещё не подтвердился " +
+                        $"(обработка: {Or(final.ProcessingPhase)}, публикация: {Or(final.PublishingPhase)}). " +
+                        "Ролик выйдет сам.");
+                }
 
                 return new PublishResult
                 {
@@ -161,6 +191,27 @@ namespace FacebookReelsPublisher.Services
                 VideoId = videoId,
                 ErrorCode = _lastErrorCode
             };
+
+        /// <summary>
+        /// Отказ, пришедший в статусе видео, а не ответом на запрос. Код берём
+        /// оттуда же: без него «файл не годится никогда» не отличить от
+        /// временного сбоя, и негодный ролик заливался бы в каждом цикле.
+        /// </summary>
+        private PublishResult FailWithStatus(string what, ReelStatus status, string videoId, bool afterFinish = false)
+        {
+            // Без условия: код от прошлого, некритичного шага (например, отказ
+            // обложки) не должен приклеиться к этому отказу.
+            _lastErrorCode = status.ErrorCode;
+
+            var hint = Hint(status.ErrorCode, 0);
+            var details = status.ErrorMessage ?? $"статус {status.VideoStatus}";
+            if (status.ErrorCode != 0) details = $"код {status.ErrorCode} | {details}";
+            if (hint != null) details += $" | → {hint}";
+
+            var result = Fail($"{what}: {details}", videoId);
+            result.RejectedAfterFinish = afterFinish;
+            return result;
+        }
 
         private static string Or(string s) => string.IsNullOrEmpty(s) ? "—" : s;
 
@@ -201,7 +252,7 @@ namespace FacebookReelsPublisher.Services
         /// <summary>Отдаёт файл Facebook. Возвращает null при успехе или текст ошибки.</summary>
         private async Task<string?> TransferAsync(string videoId, VideoPublishInfo info)
         {
-            var mode = (_settings.UploadMode ?? "auto").Trim().ToLowerInvariant();
+            var mode = (_settings.UploadMode ?? "bytes").Trim().ToLowerInvariant();
             var hasUrl = !string.IsNullOrWhiteSpace(info.VideoUrl);
             var hasFile = !string.IsNullOrWhiteSpace(info.FilePath) && File.Exists(info.FilePath);
 
@@ -286,7 +337,7 @@ namespace FacebookReelsPublisher.Services
         /// этим режимом программа работает и на машине без белого IP.
         ///
         /// Оборванную заливку Facebook разрешает продолжить с места обрыва:
-        /// в статусе лежит bytes_transfered, его и ставим в offset. Поэтому при
+        /// в статусе лежит bytes_transferred, его и ставим в offset. Поэтому при
         /// сбое мы не начинаем сеанс заново, а дозаливаем хвост.
         /// </summary>
         private async Task<string?> TransferByBytesAsync(string videoId, string path)
@@ -360,6 +411,10 @@ namespace FacebookReelsPublisher.Services
         {
             var result = new ReelStatus();
 
+            // Сорвавшийся опрос не должен подменять код настоящей ошибки
+            // публикации: DescribeError запоминает код попутно.
+            var savedErrorCode = _lastErrorCode;
+
             try
             {
                 var url = $"{GraphBase}/{videoId}?fields=status&access_token={Uri.EscapeDataString(_settings.PageAccessToken)}";
@@ -368,7 +423,8 @@ namespace FacebookReelsPublisher.Services
 
                 if (!response.IsSuccessStatusCode)
                 {
-                    result.ErrorMessage = DescribeError(text, response);
+                    result.RequestError = DescribeError(text, response);
+                    _lastErrorCode = savedErrorCode;
                     return result;
                 }
 
@@ -384,27 +440,78 @@ namespace FacebookReelsPublisher.Services
                 result.UploadingPhase = uploading?["status"]?.ToString() ?? string.Empty;
                 result.ProcessingPhase = processing?["status"]?.ToString() ?? string.Empty;
                 result.PublishingPhase = publishing?["status"]?.ToString() ?? string.Empty;
-                result.BytesTransferred = (long?)uploading?["bytes_transfered"] ?? 0;
+                // Живой ответ пишет "bytes_transferred", а в документации Meta
+                // встречается "bytes_transfered" с опечаткой. Читаем оба: с
+                // одним только ошибочным докачка всегда начиналась бы с нуля.
+                result.BytesTransferred =
+                    (long?)uploading?["bytes_transferred"]
+                    ?? (long?)uploading?["bytes_transfered"]
+                    ?? 0;
 
                 // Ошибка может лежать в любой из трёх фаз — берём первую найденную.
-                result.ErrorMessage =
-                    uploading?["error"]?["message"]?.ToString()
-                    ?? processing?["error"]?["message"]?.ToString()
-                    ?? publishing?["error"]?["message"]?.ToString();
+                var error =
+                    uploading?["error"] as JObject
+                    ?? processing?["error"] as JObject
+                    ?? publishing?["error"] as JObject;
+
+                result.ErrorMessage = error?["message"]?.ToString();
+
+                if (error != null)
+                {
+                    result.ErrorCode = int.TryParse(error["code"]?.ToString(), out var code) && code != 0
+                        ? code
+                        : CodeFromMessage(result.ErrorMessage);
+                }
             }
             catch (Exception ex)
             {
-                result.ErrorMessage = ex.Message;
+                result.RequestError = ex.Message;
             }
 
             return result;
         }
 
-        private async Task<ReelStatus> WaitForProcessingAsync(string videoId)
+        /// <summary>
+        /// Документация Meta показывает ошибку в статусе без кода — только текст
+        /// («Resolution too low…»). Восстанавливаем код по тексту: без него
+        /// «файл не годится никогда» не отличить от временного сбоя.
+        /// </summary>
+        private static int CodeFromMessage(string? message)
+        {
+            var m = (message ?? string.Empty).ToLowerInvariant();
+
+            // Узкие фразы, а не отдельные слова: «разрешение» по-русски — это и
+            // «права доступа», а «resolution» встречается в «name resolution».
+            // Ошибочно окончательный отказ стоил бы потерянного ролика.
+            if (m.Contains("aspect ratio") || m.Contains("соотношение сторон")) return 1363040;
+            if (m.Contains("resolution too low") || m.Contains("minimum resolution")
+                || m.Contains("низкое разрешение") || m.Contains("разрешение видео")) return 1363127;
+            if (m.Contains("video duration") || m.Contains("duration of") || m.Contains("длительность видео")) return 1363128;
+            if (m.Contains("frame rate") || m.Contains("частота кадров")) return 1363129;
+
+            return 0;
+        }
+
+        /// <summary>До finish: ждём, пока файл целиком окажется у Facebook.</summary>
+        private Task<ReelStatus> WaitForUploadAsync(string videoId) =>
+            PollStatusAsync(videoId, s => s.IsUploaded);
+
+        /// <summary>После finish: ждём, пока Facebook обработает и выпустит ролик.</summary>
+        private Task<ReelStatus> WaitForPublishAsync(string videoId) =>
+            PollStatusAsync(videoId, s => s.IsPublished || s.IsReady);
+
+        /// <summary>
+        /// Опрашивает статус, пока не выполнится условие, Facebook не сообщит
+        /// об ошибке или не кончится ProcessingTimeoutSeconds. Возвращает
+        /// последний статус. Сорвавшийся запрос — не ошибка видео: опрос
+        /// продолжается, а в лог идёт предупреждение.
+        /// </summary>
+        private async Task<ReelStatus> PollStatusAsync(string videoId, Func<ReelStatus, bool> done)
         {
             var deadline = DateTime.UtcNow.AddSeconds(_settings.ProcessingTimeoutSeconds);
             var last = new ReelStatus();
             var tick = 0;
+            var failures = 0;
 
             while (DateTime.UtcNow < deadline)
             {
@@ -413,14 +520,24 @@ namespace FacebookReelsPublisher.Services
 
                 last = await CheckStatusAsync(videoId);
 
-                if (last.IsError) return last;
-                if (last.IsReady || last.IsUploadedAndProcessed) return last;
+                if (last.RequestFailed)
+                {
+                    failures++;
+                    if (failures == 1 || failures % 6 == 0)
+                    {
+                        _logger.LogWarning($"      ⚠️  статус не прочитался ({last.RequestError}) — спрашиваем ещё раз");
+                    }
+                    continue;
+                }
+
+                if (last.IsError || done(last)) return last;
 
                 // Раз в 30 секунд — строчка в лог, чтобы было видно, что не зависли.
                 if (tick % 6 == 0)
                 {
                     _logger.LogInformation(
-                        $"      …загрузка: {Or(last.UploadingPhase)}, обработка: {Or(last.ProcessingPhase)}");
+                        $"      …загрузка: {Or(last.UploadingPhase)}, обработка: {Or(last.ProcessingPhase)}, " +
+                        $"публикация: {Or(last.PublishingPhase)}");
                 }
             }
 

@@ -85,6 +85,14 @@ namespace FacebookReelsPublisher.Models
         /// </summary>
         public string RequiredCaptionSuffix { get; set; } = "Twitch: MELLSTROY";
 
+        /// <summary>
+        /// Хэштеги, которые дописываются, если в тексте ролика своих нет.
+        /// По умолчанию русские: аудитория — русскоязычная, а язык подписи и
+        /// хэштегов — один из сигналов, по которым Facebook выбирает, кому
+        /// показать ролик. Пусто — хэштеги не дописываются.
+        /// </summary>
+        public string DefaultHashtags { get; set; } = "#мемы #приколы #юмор #рилс";
+
         public UniquifierSettings Uniquifier { get; set; } = new();
         public PublishingSettings Publishing { get; set; } = new();
     }
@@ -165,10 +173,12 @@ namespace FacebookReelsPublisher.Models
         /// Как отдавать видео Facebook.
         ///   "url"   — дать ссылку на наш nginx, Facebook скачает сам (как в Instagram-версии);
         ///   "bytes" — залить файл телом запроса, публичный адрес не нужен вообще;
-        ///   "auto"  — попробовать ссылку, а если Facebook её не осилит, залить байтами.
-        /// По умолчанию "auto": ссылка дешевле, но байты работают всегда.
+        ///   "auto"  — попробовать ссылку; на байты переходит, только если Facebook
+        ///             сразу отказался принять ссылку.
+        /// По умолчанию "bytes": единственный режим, проверенный вживую
+        /// (18.09.2026), и не зависит от того, виден ли сервер снаружи.
         /// </summary>
-        public string UploadMode { get; set; } = "auto";
+        public string UploadMode { get; set; } = "bytes";
     }
 
     /// <summary>
@@ -190,7 +200,7 @@ namespace FacebookReelsPublisher.Models
         public int ProcessingTimeoutSeconds { get; set; } = 300;
 
         /// <summary>Режим отдачи файла: "url" | "bytes" | "auto".</summary>
-        public string UploadMode { get; set; } = "auto";
+        public string UploadMode { get; set; } = "bytes";
     }
 
     public class TikTokMonitorSettings
@@ -254,7 +264,15 @@ namespace FacebookReelsPublisher.Models
         /// уедет из ленты автора.
         /// </summary>
         public bool IsPermanentlyRejected =>
-            ErrorCode is 1363040 or 1363127 or 1363128 or 1363129;
+            ErrorCode is 1363040 or 1363127 or 1363128 or 1363129
+            || RejectedAfterFinish;
+
+        /// <summary>
+        /// finish прошёл, а потом Facebook сам отказал видео при обработке.
+        /// Такой отказ приходит в статусе, часто без числового кода, и повторная
+        /// заливка того же файла дала бы тот же отказ — поэтому он окончательный.
+        /// </summary>
+        public bool RejectedAfterFinish { get; set; }
     }
 
     /// <summary>
@@ -274,8 +292,27 @@ namespace FacebookReelsPublisher.Models
         /// <summary>Сколько байт Facebook уже принял (для возобновления загрузки).</summary>
         public long BytesTransferred { get; set; }
 
-        /// <summary>Текст ошибки из любой фазы, если она там есть.</summary>
+        /// <summary>
+        /// Ошибка, которую сообщил САМ Facebook: в одной из фаз видео. Только
+        /// она означает, что с роликом что-то не так.
+        /// </summary>
         public string? ErrorMessage { get; set; }
+
+        /// <summary>
+        /// Код той же ошибки. Если Facebook кода не приложил (в документации
+        /// Meta его и нет), он восстанавливается по тексту — см. CheckStatusAsync.
+        /// </summary>
+        public int ErrorCode { get; set; }
+
+        /// <summary>
+        /// Статус НЕ удалось прочитать: сеть, лимит запросов, 5xx. О самом видео
+        /// это ничего не говорит, поэтому в IsError не входит — иначе один
+        /// сорвавшийся опрос после finish выглядел бы как отказ, и ролик
+        /// выложился бы повторно в следующем цикле.
+        /// </summary>
+        public string? RequestError { get; set; }
+
+        public bool RequestFailed => !string.IsNullOrEmpty(RequestError);
 
         public bool IsReady => VideoStatus == "ready";
 
@@ -288,13 +325,17 @@ namespace FacebookReelsPublisher.Models
             || !string.IsNullOrEmpty(ErrorMessage);
 
         /// <summary>
-        /// Файл принят и обработан — можно звать фазу finish. Отдельно от IsReady,
-        /// потому что Facebook держит video_status = "processing" вплоть до самой
-        /// публикации, а ждать её до вызова finish бессмысленно: finish её и
-        /// запускает.
+        /// Файл целиком у Facebook — можно звать фазу finish.
+        ///
+        /// Ждать до finish именно загрузку, а не обработку: проверено вживую
+        /// 18.09.2026 — processing_phase стоит в "not_started", пока не вызван
+        /// finish, и не сдвинется, сколько ни жди. Ожидание обработки до finish
+        /// съедало на каждой публикации весь таймаут (5 минут) впустую.
         /// </summary>
-        public bool IsUploadedAndProcessed =>
-            UploadingPhase == "complete" && ProcessingPhase == "complete";
+        public bool IsUploaded => UploadingPhase == "complete";
+
+        /// <summary>Facebook закончил публикацию после finish.</summary>
+        public bool IsPublished => PublishingPhase == "complete";
     }
 
     public class VideoPublishInfo

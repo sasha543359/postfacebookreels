@@ -460,7 +460,8 @@ namespace FacebookReelsPublisher
                         var description = BuildDescription(
                             newVideo,
                             page.CustomCaption,
-                            appSettings.RequiredCaptionSuffix);
+                            appSettings.RequiredCaptionSuffix,
+                            appSettings.DefaultHashtags);
 
                         // Показываем итоговое описание целиком. Оно собирается из
                         // трёх кусков (текст, обязательная подпись, хэштеги), и без
@@ -574,7 +575,7 @@ namespace FacebookReelsPublisher
         /// ролика, и к CustomCaption. Единственное исключение: если она уже есть
         /// в тексте, второй раз не дублируется.
         /// </summary>
-        static string BuildDescription(TikTokVideo video, string? customCaption, string? requiredSuffix)
+        static string BuildDescription(TikTokVideo video, string? customCaption, string? requiredSuffix, string? defaultHashtags)
         {
             var text = (!string.IsNullOrWhiteSpace(customCaption) ? customCaption : video.Title ?? string.Empty).Trim();
 
@@ -599,9 +600,10 @@ namespace FacebookReelsPublisher
                 parts.Add(suffix);
             }
 
-            if (!text.Contains('#'))
+            var hashtags = (defaultHashtags ?? string.Empty).Trim();
+            if (hashtags.Length > 0 && !text.Contains('#'))
             {
-                parts.Add("#reels #viral #trending");
+                parts.Add(hashtags);
             }
 
             return string.Join("\n\n", parts);
@@ -638,6 +640,7 @@ namespace FacebookReelsPublisher
             configTable.AddRow("🌐 Публичный адрес", Esc(string.IsNullOrWhiteSpace(server.PublicUrl) ? "не задан" : server.PublicUrl));
             configTable.AddRow("📤 Как отдаём файл", Esc(server.UploadMode));
             configTable.AddRow("✍️  Обязательная подпись", Esc(string.IsNullOrWhiteSpace(appSettings.RequiredCaptionSuffix) ? "нет" : appSettings.RequiredCaptionSuffix));
+            configTable.AddRow("#️⃣  Хэштеги (если своих нет)", Esc(string.IsNullOrWhiteSpace(appSettings.DefaultHashtags) ? "не дописываются" : appSettings.DefaultHashtags));
             configTable.AddRow("🚦 Лимит на Страницу за 24ч", $"{appSettings.Publishing.MaxPostsPerPagePerDay} (потолок Facebook: {appSettings.Publishing.ApiHardLimitPer24h})");
             configTable.AddRow("💾 История", "Последние 5 видео с timestamp");
 
@@ -675,7 +678,7 @@ namespace FacebookReelsPublisher
                 PageAccessToken = page.PageAccessToken,
                 ApiVersion = config["Facebook:ApiVersion"] ?? "v26.0",
                 ProcessingTimeoutSeconds = int.TryParse(config["Facebook:ProcessingTimeoutSeconds"], out var t) ? t : 300,
-                UploadMode = string.IsNullOrWhiteSpace(server.UploadMode) ? "auto" : server.UploadMode
+                UploadMode = string.IsNullOrWhiteSpace(server.UploadMode) ? "bytes" : server.UploadMode
             });
 
             return new FacebookReelsService(settings, logger, httpClient);
