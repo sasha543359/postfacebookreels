@@ -88,13 +88,19 @@ namespace FacebookReelsPublisher.Services
                 }
                 catch (OperationCanceledException)
                 {
-                    try { process.Kill(true); } catch { }
+                    try { process.Kill(true); process.WaitForExit(5000); } catch { }
+                    // Недописанный результат, кроме нас, удалить некому: конвейер
+                    // знает только исходник. Замер 18.09.2026 на дроплете за $6:
+                    // 16 с ролика 1080p60 обрабатывались 252 с, и обрывки по 10 МБ
+                    // оставались в /var/www/videos после каждого таймаута.
+                    TryDelete(outputPath);
                     _logger.LogWarning($"   ⚠️ Уникализация превысила таймаут {_settings.TimeoutSeconds}с — публикуем исходник.");
                     return inputPath;
                 }
 
                 if (process.ExitCode != 0 || !File.Exists(outputPath))
                 {
+                    TryDelete(outputPath);
                     _logger.LogWarning($"   ⚠️ Уникализатор вернул код {process.ExitCode}. Публикуем исходник.\n{TrimErr(err.ToString())}");
                     return inputPath;
                 }
@@ -104,6 +110,7 @@ namespace FacebookReelsPublisher.Services
             }
             catch (Exception ex)
             {
+                TryDelete(outputPath);
                 _logger.LogWarning(ex, "   ⚠️ Ошибка уникализации — публикуем исходник.");
                 return inputPath;
             }
