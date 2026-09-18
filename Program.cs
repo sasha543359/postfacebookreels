@@ -68,6 +68,26 @@ namespace FacebookReelsPublisher
                 return;
             }
 
+            // Свой файл тем же конвейером, что и ролик из TikTok. Нужен, чтобы
+            // проверить Страницу сразу, а не ждать, пока кто-то из авторов
+            // выложит новое видео.
+            var fileArg = Array.IndexOf(args, "--publish-file");
+            if (fileArg >= 0)
+            {
+                await RunPublishFileAsync(
+                    serviceProvider,
+                    config,
+                    appSettings,
+                    server,
+                    pages,
+                    tiktokMonitor,
+                    uniquifier,
+                    throttle,
+                    file: fileArg + 1 < args.Length ? args[fileArg + 1] : null,
+                    pageName: fileArg + 2 < args.Length ? args[fileArg + 2] : null);
+                return;
+            }
+
             var checkInterval = appSettings.CheckIntervalMinutes;
             var tiktokDelay = appSettings.TikTokCheckDelaySeconds;
 
@@ -326,6 +346,79 @@ namespace FacebookReelsPublisher
         }
 
         // ─────────────────────────────────────────────────────────────────────
+        //  Режим --publish-file
+        // ─────────────────────────────────────────────────────────────────────
+
+        /// <summary>
+        /// Публикует свой файл так, будто он пришёл из TikTok: уникализатор,
+        /// подрезка, описание с обязательной подписью, лимиты Страницы. Файл
+        /// должен лежать внутри контейнера — на сервере это папка
+        /// /var/www/videos, она общая с хостом.
+        /// </summary>
+        static async Task RunPublishFileAsync(
+            IServiceProvider serviceProvider,
+            IConfiguration config,
+            AppSettings appSettings,
+            ServerSettings server,
+            List<FacebookPageSettings> pages,
+            ITikTokMonitorService monitor,
+            IVideoUniquifierService uniquifier,
+            IPublishThrottle throttle,
+            string? file,
+            string? pageName)
+        {
+            if (file == null || !File.Exists(file))
+            {
+                AnsiConsole.MarkupLine($"[red]❌ Файл не найден: {Esc(file ?? "не указан")}[/]");
+                AnsiConsole.MarkupLine("[grey]   Пример: docker compose run --rm app --publish-file /var/www/videos/ролик.mp4 [[ИмяСтраницы]][/]");
+                return;
+            }
+
+            var page = pageName == null
+                ? pages.FirstOrDefault(p => !string.IsNullOrWhiteSpace(p.PageAccessToken))
+                : pages.FirstOrDefault(p => string.Equals(p.PageName, pageName, StringComparison.OrdinalIgnoreCase));
+
+            if (page == null || string.IsNullOrWhiteSpace(page.PageAccessToken))
+            {
+                AnsiConsole.MarkupLine($"[red]❌ Страница {Esc(pageName ?? "с токеном")} не найдена в appsettings.json[/]");
+                return;
+            }
+
+            // Лимиты те же, что у цикла: ручная публикация тоже идёт в зачёт
+            // 30 роликов за 24 часа, которые Facebook считает сам.
+            if (!throttle.CanPost(page.PageName, out var reason))
+            {
+                AnsiConsole.MarkupLine($"[yellow]⏸️  {Esc(reason)} — публикацию не начинаем[/]");
+                return;
+            }
+
+            var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            var video = new TikTokVideo { Id = $"file-{now}", Timestamp = now };
+
+            AnsiConsole.MarkupLine($"[blue]📍 Страница: {Esc(page.PageName)} ← файл {Esc(Path.GetFileName(file))}[/]\n");
+
+            try
+            {
+                await DownloadAndPublishVideo(
+                    video,
+                    Path.GetFileName(file),
+                    historyKey: null,
+                    page,
+                    appSettings,
+                    server,
+                    monitor,
+                    CreateFacebookService(serviceProvider, config, page, server),
+                    uniquifier,
+                    throttle,
+                    preparedFile: file);
+            }
+            catch
+            {
+                // Текст ошибки уже выведен внутри конвейера.
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────────────────
         //  Нормализация ников
         // ─────────────────────────────────────────────────────────────────────
 
@@ -383,17 +476,20 @@ namespace FacebookReelsPublisher
         //  Скачать и опубликовать
         // ─────────────────────────────────────────────────────────────────────
 
+        /// <param name="historyKey">null — ролик не из TikTok (режим --publish-file), в историю авторов его не пишем.</param>
+        /// <param name="preparedFile">Готовый файл вместо скачивания. Работаем с его копией: конвейер удаляет свои файлы по ходу дела.</param>
         static async Task DownloadAndPublishVideo(
             TikTokVideo newVideo,
             string tiktokUsername,
-            string historyKey,
+            string? historyKey,
             FacebookPageSettings page,
             AppSettings appSettings,
             ServerSettings server,
             ITikTokMonitorService tiktokMonitor,
             IFacebookReelsService facebookService,
             IVideoUniquifierService uniquifier,
-            IPublishThrottle throttle)
+            IPublishThrottle throttle,
+            string? preparedFile = null)
         {
             await AnsiConsole.Status()
                 .Spinner(Spinner.Known.Dots)
@@ -404,8 +500,16 @@ namespace FacebookReelsPublisher
 
                     try
                     {
-                        ctx.Status("📥 Скачиваем видео с TikTok...");
-                        localPath = await tiktokMonitor.DownloadVideo(newVideo);
+                        if (preparedFile != null)
+                        {
+                            localPath = Path.Combine(Path.GetDirectoryName(Path.GetFullPath(preparedFile))!, $"{newVideo.Id}.mp4");
+                            File.Copy(preparedFile, localPath, overwrite: true);
+                        }
+                        else
+                        {
+                            ctx.Status("📥 Скачиваем видео с TikTok...");
+                            localPath = await tiktokMonitor.DownloadVideo(newVideo);
+                        }
 
                         // УНИКАЛИЗАЦИЯ (если включена). При любом сбое сервис
                         // возвращает исходник — публикация не ломается.
@@ -485,15 +589,22 @@ namespace FacebookReelsPublisher
 
                         if (result.Success)
                         {
-                            tiktokMonitor.MarkVideoAsProcessed(historyKey, newVideo.Id, newVideo.Timestamp);
+                            if (historyKey != null)
+                            {
+                                tiktokMonitor.MarkVideoAsProcessed(historyKey, newVideo.Id, newVideo.Timestamp);
+                            }
                             throttle.RecordPost(page.PageName);
+
+                            var source = historyKey != null
+                                ? $"[grey]TikTok:[/] [cyan]@{Esc(tiktokUsername)}[/]\n"
+                                : $"[grey]Файл:[/] [cyan]{Esc(tiktokUsername)}[/]\n";
 
                             var successPanel = new Panel(
                                 new Markup($"[green]✓ Reels успешно опубликован![/]\n\n" +
                                            $"[grey]Страница:[/] [cyan]{Esc(page.PageName)}[/]\n" +
                                            $"[grey]Video ID:[/] [yellow]{Esc(result.VideoId ?? "—")}[/]\n" +
                                            $"[grey]Post ID:[/] [yellow]{Esc(result.PostId ?? "—")}[/]\n" +
-                                           $"[grey]TikTok:[/] [cyan]@{Esc(tiktokUsername)}[/]\n" +
+                                           source +
                                            $"[grey]За 24 часа:[/] [cyan]{throttle.PostsLast24h(page.PageName)}[/]"))
                             {
                                 Border = BoxBorder.Double,
@@ -508,7 +619,10 @@ namespace FacebookReelsPublisher
                             // сюда снова каждые несколько минут: иначе один
                             // негодный ролик способен занять собой весь цикл и
                             // всю суточную квоту.
-                            tiktokMonitor.MarkVideoAsProcessed(historyKey, newVideo.Id, newVideo.Timestamp);
+                            if (historyKey != null)
+                            {
+                                tiktokMonitor.MarkVideoAsProcessed(historyKey, newVideo.Id, newVideo.Timestamp);
+                            }
 
                             var skipPanel = new Panel(
                                 new Markup($"[yellow]⏭️  Facebook не примет этот ролик[/]\n\n" +
