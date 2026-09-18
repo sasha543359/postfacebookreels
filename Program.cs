@@ -371,6 +371,7 @@ namespace FacebookReelsPublisher
             {
                 AnsiConsole.MarkupLine($"[red]❌ Файл не найден: {Esc(file ?? "не указан")}[/]");
                 AnsiConsole.MarkupLine("[grey]   Пример: docker compose run --rm app --publish-file /var/www/videos/ролик.mp4 [[ИмяСтраницы]][/]");
+                Environment.ExitCode = 1;
                 return;
             }
 
@@ -378,9 +379,19 @@ namespace FacebookReelsPublisher
                 ? pages.FirstOrDefault(p => !string.IsNullOrWhiteSpace(p.PageAccessToken))
                 : pages.FirstOrDefault(p => string.Equals(p.PageName, pageName, StringComparison.OrdinalIgnoreCase));
 
-            if (page == null || string.IsNullOrWhiteSpace(page.PageAccessToken))
+            if (page == null)
             {
-                AnsiConsole.MarkupLine($"[red]❌ Страница {Esc(pageName ?? "с токеном")} не найдена в appsettings.json[/]");
+                AnsiConsole.MarkupLine(pageName == null
+                    ? "[red]❌ Ни у одной Страницы в appsettings.json не заполнен PageAccessToken[/]"
+                    : $"[red]❌ Страницы {Esc(pageName)} нет в appsettings.json (смотри поле PageName)[/]");
+                Environment.ExitCode = 1;
+                return;
+            }
+
+            if (string.IsNullOrWhiteSpace(page.PageAccessToken))
+            {
+                AnsiConsole.MarkupLine($"[red]❌ У Страницы {Esc(page.PageName)} не заполнен PageAccessToken в appsettings.json[/]");
+                Environment.ExitCode = 1;
                 return;
             }
 
@@ -389,6 +400,7 @@ namespace FacebookReelsPublisher
             if (!throttle.CanPost(page.PageName, out var reason))
             {
                 AnsiConsole.MarkupLine($"[yellow]⏸️  {Esc(reason)} — публикацию не начинаем[/]");
+                Environment.ExitCode = 1;
                 return;
             }
 
@@ -397,9 +409,11 @@ namespace FacebookReelsPublisher
 
             AnsiConsole.MarkupLine($"[blue]📍 Страница: {Esc(page.PageName)} ← файл {Esc(Path.GetFileName(file))}[/]\n");
 
+            var published = false;
+
             try
             {
-                await DownloadAndPublishVideo(
+                published = await DownloadAndPublishVideo(
                     video,
                     Path.GetFileName(file),
                     historyKey: null,
@@ -415,6 +429,12 @@ namespace FacebookReelsPublisher
             catch
             {
                 // Текст ошибки уже выведен внутри конвейера.
+            }
+
+            // Для тех, кто запускает команду из скрипта: неудача видна по коду выхода.
+            if (!published)
+            {
+                Environment.ExitCode = 1;
             }
         }
 
@@ -478,7 +498,7 @@ namespace FacebookReelsPublisher
 
         /// <param name="historyKey">null — ролик не из TikTok (режим --publish-file), в историю авторов его не пишем.</param>
         /// <param name="preparedFile">Готовый файл вместо скачивания. Работаем с его копией: конвейер удаляет свои файлы по ходу дела.</param>
-        static async Task DownloadAndPublishVideo(
+        static async Task<bool> DownloadAndPublishVideo(
             TikTokVideo newVideo,
             string tiktokUsername,
             string? historyKey,
@@ -491,6 +511,14 @@ namespace FacebookReelsPublisher
             IPublishThrottle throttle,
             string? preparedFile = null)
         {
+            var published = false;
+
+            // Сообщения при неудаче: у цикла ролик вернётся сам, а ручную
+            // публикацию повторяет человек.
+            var retryHint = historyKey != null
+                ? "ID НЕ сохранён — попробуем снова в следующем цикле"
+                : "Ролик не опубликован — запусти команду ещё раз";
+
             await AnsiConsole.Status()
                 .Spinner(Spinner.Known.Dots)
                 .SpinnerStyle(Style.Parse("green bold"))
@@ -559,7 +587,10 @@ namespace FacebookReelsPublisher
                             AnsiConsole.MarkupLine($"[grey]   🖼️  Обложка:[/] {Esc(coverPath)}");
                         }
 
-                        ctx.Status($"📘 Публикуем Reels ({page.PageName})...");
+                        // Esc обязателен: статус рисуется в фоновом потоке, и
+                        // скобка в имени Страницы роняла там весь процесс мимо
+                        // любого catch.
+                        ctx.Status($"📘 Публикуем Reels ({Esc(page.PageName)})...");
 
                         var description = BuildDescription(
                             newVideo,
@@ -589,6 +620,8 @@ namespace FacebookReelsPublisher
 
                         if (result.Success)
                         {
+                            published = true;
+
                             if (historyKey != null)
                             {
                                 tiktokMonitor.MarkVideoAsProcessed(historyKey, newVideo.Id, newVideo.Timestamp);
@@ -628,7 +661,9 @@ namespace FacebookReelsPublisher
                                 new Markup($"[yellow]⏭️  Facebook не примет этот ролик[/]\n\n" +
                                            $"[grey]{Esc(result.ErrorMessage ?? "без текста")}[/]\n\n" +
                                            $"[grey]Дело в самом файле, а не в связи, поэтому повторять нечего.[/]\n" +
-                                           $"[grey]Ролик помечен как обработанный и больше не будет пробоваться.[/]"))
+                                           (historyKey != null
+                                               ? "[grey]Ролик помечен как обработанный и больше не будет пробоваться.[/]"
+                                               : "[grey]С этим файлом повторять команду бесполезно — нужен другой ролик.[/]")))
                             {
                                 Border = BoxBorder.Double,
                                 BorderStyle = new Style(Color.Yellow)
@@ -640,7 +675,7 @@ namespace FacebookReelsPublisher
                             var errorPanel = new Panel(
                                 new Markup($"[red]❌ Ошибка публикации[/]\n\n" +
                                            $"[grey]{Esc(result.ErrorMessage ?? "без текста")}[/]\n\n" +
-                                           $"[yellow]ID НЕ сохранён — попробуем снова в следующем цикле[/]"))
+                                           $"[yellow]{retryHint}[/]"))
                             {
                                 Border = BoxBorder.Double,
                                 BorderStyle = new Style(Color.Red)
@@ -654,12 +689,14 @@ namespace FacebookReelsPublisher
                     {
                         AnsiConsole.WriteLine();
                         AnsiConsole.MarkupLine($"[red]❌ Ошибка: {Esc(ex.Message)}[/]");
-                        AnsiConsole.MarkupLine("[yellow]ID НЕ сохранён — попробуем снова в следующем цикле[/]");
+                        AnsiConsole.MarkupLine($"[yellow]{retryHint}[/]");
 
                         DeleteLocal(localPath);
                         throw;
                     }
                 });
+
+            return published;
         }
 
         static void DeleteLocal(string? path)

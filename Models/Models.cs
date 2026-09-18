@@ -112,7 +112,7 @@ namespace FacebookReelsPublisher.Models
         /// это два разных дня, а по счётчику Facebook одно окно, и вторая пачка
         /// начала бы отбиваться ошибкой 613.
         /// </summary>
-        public int MaxPostsPerPagePerDay { get; set; } = 5;
+        public int MaxPostsPerPagePerDay { get; set; } = 8;
 
         /// <summary>Минимальный интервал между публикациями одной Страницы, минут. 0 = без интервала.</summary>
         public int MinMinutesBetweenPosts { get; set; } = 3;

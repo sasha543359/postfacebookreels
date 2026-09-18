@@ -50,6 +50,11 @@ namespace FacebookReelsPublisher.Services
 
             lock (_lock)
             {
+                // Файл — единственный источник правды: рядом с циклом может
+                // отработать разовый «--publish-file» в соседнем контейнере, и
+                // его публикация должна попасть и в лимит, и в паузу.
+                Load();
+
                 var times = Recent(page);
 
                 // Потолок самого Facebook. Действует всегда, даже если в
@@ -96,6 +101,9 @@ namespace FacebookReelsPublisher.Services
         {
             lock (_lock)
             {
+                // Перечитываем, чтобы не затереть чужую запись своей старой копией.
+                Load();
+
                 var times = Recent(page);
                 times.Add(Now);
                 _posts[page] = times;
@@ -135,19 +143,44 @@ namespace FacebookReelsPublisher.Services
             return fresh;
         }
 
+        private bool _warnedUnreadable;
+
+        /// <summary>
+        /// Сливает файл с тем, что уже известно в памяти, а не заменяет одно
+        /// другим. Времена публикаций только добавляются (стареют они в Recent),
+        /// поэтому объединение ничего лишнего не воскресит — зато не потеряет ни
+        /// запись соседнего процесса, ни свою, если прошлая запись файла не удалась.
+        /// </summary>
         private void Load()
         {
             try
             {
                 if (!File.Exists(_cfg.CountsPath))
                 {
-                    _posts = new Dictionary<string, List<long>>();
                     return;
                 }
 
                 var json = File.ReadAllText(_cfg.CountsPath);
-                _posts = JsonConvert.DeserializeObject<Dictionary<string, List<long>>>(json)
-                         ?? new Dictionary<string, List<long>>();
+                var loaded = JsonConvert.DeserializeObject<Dictionary<string, List<long>>>(json)
+                             ?? new Dictionary<string, List<long>>();
+
+                // Время хранится с точностью до секунды, и две публикации могут
+                // совпасть. Поэтому не Distinct, а «сколько раз встречается»:
+                // берём большее из файла и из памяти — одна и та же запись не
+                // удвоится, а две разные в одну секунду не склеятся.
+                foreach (var (page, times) in _posts)
+                {
+                    var fromFile = loaded.TryGetValue(page, out var f) && f != null ? f : new List<long>();
+
+                    loaded[page] = fromFile.Concat(times)
+                        .Distinct()
+                        .SelectMany(t => Enumerable.Repeat(t, Math.Max(
+                            fromFile.Count(x => x == t),
+                            times.Count(x => x == t))))
+                        .ToList();
+                }
+
+                _posts = loaded;
             }
             catch (Exception ex)
             {
@@ -155,15 +188,23 @@ namespace FacebookReelsPublisher.Services
                 // ({ "дата": { "аккаунт": число } }). Разобрать его нечем, но и
                 // падать не из-за чего: худшее последствие — одна Страница
                 // сможет выложить лишний ролик в первые сутки после обновления.
-                _logger.LogWarning(
-                    $"Счётчик публикаций не прочитался ({ex.Message}) — начинаем с чистого. " +
-                    "Если файл остался от прошлой версии программы, это нормально и бывает один раз.");
-                _posts = new Dictionary<string, List<long>>();
+                // То, что уже известно из прошлых чтений, не выбрасываем, а
+                // предупреждаем один раз: файл перечитывается перед каждой
+                // проверкой, и иначе предупреждение шло бы в лог каждый цикл.
+                if (!_warnedUnreadable)
+                {
+                    _logger.LogWarning(
+                        $"Счётчик публикаций не прочитался ({ex.Message}) — считаем только то, что известно этому запуску. " +
+                        "Если файл остался от прошлой версии программы, это нормально и бывает один раз.");
+                    _warnedUnreadable = true;
+                }
             }
         }
 
         private void Save()
         {
+            string? tmp = null;
+
             try
             {
                 var dir = Path.GetDirectoryName(_cfg.CountsPath);
@@ -172,11 +213,28 @@ namespace FacebookReelsPublisher.Services
                     Directory.CreateDirectory(dir);
                 }
 
-                File.WriteAllText(_cfg.CountsPath, JsonConvert.SerializeObject(_posts, Formatting.Indented));
+                // Через временный файл: соседний процесс читает счётчик в любой
+                // момент и не должен застать его записанным наполовину. Имя
+                // уникальное, потому что пишут два контейнера, а PID у dotnet в
+                // обоих один и тот же — 1.
+                tmp = $"{_cfg.CountsPath}.{Guid.NewGuid():N}.tmp";
+                File.WriteAllText(tmp, JsonConvert.SerializeObject(_posts, Formatting.Indented));
+                File.Move(tmp, _cfg.CountsPath, overwrite: true);
             }
             catch (Exception ex)
             {
+                // Публикация не потеряется: она осталась в памяти, и Load её не
+                // выбросит — запишется со следующим сохранением.
                 _logger.LogWarning(ex, "Не удалось сохранить счётчик публикаций.");
+
+                try
+                {
+                    if (tmp != null && File.Exists(tmp)) File.Delete(tmp);
+                }
+                catch
+                {
+                    // Не удалось и убрать за собой — не страшно, файл маленький.
+                }
             }
         }
     }
