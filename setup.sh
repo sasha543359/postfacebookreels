@@ -59,6 +59,16 @@ echo "=== 4/7  Папки ==="
 mkdir -p "$MEDIA/covers"
 chmod -R 755 "$MEDIA"
 
+# Веб-консоль DigitalOcean вставляет текст (Ctrl+Shift+V) в «скобках»
+# ^[[200~ … ~, и вставленная команда падает с «command not found».
+# Проверено 18.09.2026. Отключаем этот режим для всех будущих сеансов root.
+if ! grep -q "enable-bracketed-paste" /root/.bashrc 2>/dev/null; then
+  cat >> /root/.bashrc << 'BASHRC'
+# Веб-консоль DigitalOcean вставляет текст с мусором ^[[200~ — отключаем этот режим.
+[[ $- == *i* ]] && bind "set enable-bracketed-paste off"
+BASHRC
+fi
+
 echo "=== 5/7  Nginx ==="
 # Отдаёт скачанные видео наружу — по этой ссылке Facebook забирает файл.
 # Нужен только в режимах "url" и "auto". В режиме "bytes" (стоит по умолчанию)
