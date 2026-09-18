@@ -248,7 +248,7 @@ docker compose build && docker compose run --rm app --check nasa shotstroy
 ```jsonc
 "Publishing": {
   "MaxPostsPerPagePerDay": 5,    // своих публикаций на Страницу за 24 часа
-  "MinMinutesBetweenPosts": 90,  // пауза между публикациями одной Страницы
+  "MinMinutesBetweenPosts": 3,   // пауза между публикациями одной Страницы
   "ApiHardLimitPer24h": 30       // потолок Facebook, не трогать
 }
 ```

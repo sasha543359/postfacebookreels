@@ -115,7 +115,7 @@ namespace FacebookReelsPublisher.Models
         public int MaxPostsPerPagePerDay { get; set; } = 5;
 
         /// <summary>Минимальный интервал между публикациями одной Страницы, минут. 0 = без интервала.</summary>
-        public int MinMinutesBetweenPosts { get; set; } = 90;
+        public int MinMinutesBetweenPosts { get; set; } = 3;
 
         /// <summary>
         /// Файл счётчика. Лежит в папке видео, потому что она примонтирована
