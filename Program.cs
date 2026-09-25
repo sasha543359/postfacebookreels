@@ -49,6 +49,24 @@ namespace FacebookReelsPublisher
             // как «аккаунта нет» — то есть как чужая поломка.
             NormalizeTikTokUsernames(pages);
 
+            // Имя Страницы — ключ её истории и суточного счётчика. Две рабочие
+            // Страницы с одним именем (обычная ошибка при копировании блока в
+            // appsettings.json) делили бы лимит на двоих, а общего автора
+            // публиковала бы только первая — и ничто в логе на это не указало бы.
+            // Проверка стоит до --check, чтобы он первым о ней и сказал.
+            var duplicate = pages
+                .Where(p => p.NotReadyReason == null)
+                .GroupBy(p => p.PageName.Trim(), StringComparer.OrdinalIgnoreCase)
+                .FirstOrDefault(g => g.Count() > 1);
+            if (duplicate != null)
+            {
+                AnsiConsole.MarkupLine($"[red]❌ В appsettings.json у двух Страниц одинаковое имя PageName: «{Esc(duplicate.Key)}».[/]");
+                AnsiConsole.MarkupLine("[yellow]   У каждой Страницы должно быть своё имя — по нему программа помнит, что уже выложила.\n" +
+                                       "   Поменяй его в скопированном блоке и пересобери: docker compose up -d --build[/]");
+                Environment.ExitCode = 1;
+                return;
+            }
+
             var server = new ServerSettings();
             config.GetSection("Server").Bind(server);
 
@@ -274,12 +292,26 @@ namespace FacebookReelsPublisher
             AnsiConsole.Write(fbTable);
 
             // ── TikTok ───────────────────────────────────────────────────────
+            // Авторов выключенных Страниц не проверяем: в шаблоне у второй
+            // Страницы стоят ники-примеры, и заполнивший только первую видел бы
+            // в таблице чужие ники. Не готова ни одна Страница — проверяем
+            // всех, чтобы ленты можно было проверить ещё до токенов.
+            var ready = pages.Where(p => p.NotReadyReason == null).ToList();
+            var skipped = ready.Count > 0 && names.Length == 0
+                ? pages.Where(p => p.NotReadyReason != null && p.TikTokUsernames.Count > 0).ToList()
+                : new List<FacebookPageSettings>();
+
             var targets = (names.Length > 0
                     ? names.Select(TikTokMonitorService.NormalizeUsername)
-                    : pages.SelectMany(p => p.TikTokUsernames))
+                    : (ready.Count > 0 ? ready : pages).SelectMany(p => p.TikTokUsernames))
                 .Where(n => n.Length > 0)
                 .Distinct(StringComparer.OrdinalIgnoreCase)
                 .ToList();
+
+            if (skipped.Count > 0)
+            {
+                AnsiConsole.MarkupLine($"\n[grey]Авторов выключенных Страниц не проверяем: {Esc(string.Join(", ", skipped.Select(p => p.PageName)))}[/]");
+            }
 
             if (targets.Count == 0)
             {
