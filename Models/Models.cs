@@ -28,9 +28,8 @@ namespace FacebookReelsPublisher.Models
         /// а у приложения — разрешения pages_show_list, pages_read_engagement,
         /// pages_manage_posts.
         ///
-        /// ВАЖНО: у Страницы, которой сейчас не пользуешься, ставь "" (пустую
-        /// строку). Заглушка вроде "REPLACE_ME" НЕ пустая — программа сочтёт её
-        /// рабочей, полезет публиковать и будет сыпать ошибками авторизации.
+        /// Пусто или заглушка из шаблона («ВСТАВЬ_…») — Страница пропускается
+        /// (см. NotReadyReason).
         /// </summary>
         public string PageAccessToken { get; set; } = string.Empty;
 
@@ -61,6 +60,24 @@ namespace FacebookReelsPublisher.Models
 
         /// <summary>Экранная подпись (материальная трансформация). Пусто — без подписи.</summary>
         public string? OnScreenCaption { get; set; }
+
+        /// <summary>
+        /// Почему Страница не может публиковать, или null, если может.
+        ///
+        /// Заглушка из шаблона («ВСТАВЬ_…») считается незаполненным полем, как
+        /// пустая строка. Раньше программа принимала её за настоящий токен, и
+        /// оставленный в шаблоне блок второй Страницы каждые пять минут
+        /// отбивался ошибкой авторизации — поэтому в шаблоне у неё стояли
+        /// пустые строки, и было непонятно, куда что вставлять.
+        /// </summary>
+        public string? NotReadyReason =>
+            IsBlank(PageAccessToken) ? "не вставлен токен (PageAccessToken)"
+            : IsBlank(PageId) ? "не вставлен ID Страницы (PageId)"
+            : null;
+
+        private static bool IsBlank(string? value) =>
+            string.IsNullOrWhiteSpace(value)
+            || value.TrimStart().StartsWith("ВСТАВЬ", StringComparison.OrdinalIgnoreCase);
 
         /// <summary>
         /// Хэштеги этой Страницы вместо общих AppSettings.DefaultHashtags.

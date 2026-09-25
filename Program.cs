@@ -133,9 +133,9 @@ namespace FacebookReelsPublisher
                         {
                             var page = pages[pageIndex];
 
-                            if (string.IsNullOrEmpty(page.PageAccessToken))
+                            if (page.NotReadyReason is { } notReady)
                             {
-                                AnsiConsole.MarkupLine($"[red]⚠️  {Esc(page.PageName)} - нет токена, пропускаем[/]\n");
+                                AnsiConsole.MarkupLine($"[grey]⏭️  {Esc(page.PageName)} - {Esc(notReady)}, пропускаем[/]\n");
                                 continue;
                             }
 
@@ -256,9 +256,9 @@ namespace FacebookReelsPublisher
 
             foreach (var page in pages)
             {
-                if (string.IsNullOrWhiteSpace(page.PageAccessToken))
+                if (page.NotReadyReason is { } notReady)
                 {
-                    fbTable.AddRow(Esc(page.PageName), Esc(page.PageId), "[grey]токен пустой — Страница выключена[/]");
+                    fbTable.AddRow(Esc(page.PageName), Esc(page.PageId), $"[grey]{Esc(notReady)} — Страница выключена[/]");
                     continue;
                 }
 
@@ -376,21 +376,21 @@ namespace FacebookReelsPublisher
             }
 
             var page = pageName == null
-                ? pages.FirstOrDefault(p => !string.IsNullOrWhiteSpace(p.PageAccessToken))
+                ? pages.FirstOrDefault(p => p.NotReadyReason == null)
                 : pages.FirstOrDefault(p => string.Equals(p.PageName, pageName, StringComparison.OrdinalIgnoreCase));
 
             if (page == null)
             {
                 AnsiConsole.MarkupLine(pageName == null
-                    ? "[red]❌ Ни у одной Страницы в appsettings.json не заполнен PageAccessToken[/]"
+                    ? "[red]❌ Ни у одной Страницы в appsettings.json не вставлены PageId и PageAccessToken[/]"
                     : $"[red]❌ Страницы {Esc(pageName)} нет в appsettings.json (смотри поле PageName)[/]");
                 Environment.ExitCode = 1;
                 return;
             }
 
-            if (string.IsNullOrWhiteSpace(page.PageAccessToken))
+            if (page.NotReadyReason is { } notReady)
             {
-                AnsiConsole.MarkupLine($"[red]❌ У Страницы {Esc(page.PageName)} не заполнен PageAccessToken в appsettings.json[/]");
+                AnsiConsole.MarkupLine($"[red]❌ У Страницы {Esc(page.PageName)} {Esc(notReady)} в appsettings.json[/]");
                 Environment.ExitCode = 1;
                 return;
             }
@@ -779,7 +779,7 @@ namespace FacebookReelsPublisher
 
             foreach (var page in pages)
             {
-                var status = string.IsNullOrEmpty(page.PageAccessToken) ? "[red]❌ Нет токена[/]" : "[green]✓ Активна[/]";
+                var status = page.NotReadyReason is { } notReady ? $"[red]❌ {Esc(notReady)}[/]" : "[green]✓ Активна[/]";
                 var tiktoks = string.Join(", ", page.TikTokUsernames.Select(u => $"@{Esc(u)}"));
                 pagesTable.AddRow(Esc(page.PageName), tiktoks, status);
             }
