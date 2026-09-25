@@ -302,7 +302,7 @@ namespace FacebookReelsPublisher
                 var description = BuildDescription(
                     sample,
                     page.CustomCaption,
-                    appSettings.RequiredCaptionSuffix,
+                    SuffixFor(page, appSettings),
                     HashtagsFor(page, appSettings));
 
                 AnsiConsole.MarkupLine($"\n[cyan]Описание под роликами {Esc(page.PageName)}:[/]");
@@ -653,7 +653,7 @@ namespace FacebookReelsPublisher
                         var description = BuildDescription(
                             newVideo,
                             page.CustomCaption,
-                            appSettings.RequiredCaptionSuffix,
+                            SuffixFor(page, appSettings),
                             HashtagsFor(page, appSettings));
 
                         // Показываем итоговое описание целиком. Оно собирается из
@@ -828,6 +828,10 @@ namespace FacebookReelsPublisher
         static string HashtagsFor(FacebookPageSettings page, AppSettings appSettings) =>
             string.IsNullOrWhiteSpace(page.DefaultHashtags) ? appSettings.DefaultHashtags : page.DefaultHashtags;
 
+        /// <summary>Обязательная строка Страницы, если задана, иначе общая.</summary>
+        static string SuffixFor(FacebookPageSettings page, AppSettings appSettings) =>
+            string.IsNullOrWhiteSpace(page.RequiredCaptionSuffix) ? appSettings.RequiredCaptionSuffix : page.RequiredCaptionSuffix;
+
         // ─────────────────────────────────────────────────────────────────────
         //  Вывод настроек
         // ─────────────────────────────────────────────────────────────────────
@@ -858,6 +862,10 @@ namespace FacebookReelsPublisher
             configTable.AddRow("📤 Как отдаём файл", Esc(server.UploadMode));
             configTable.AddRow("✍️  Обязательная подпись", Esc(string.IsNullOrWhiteSpace(appSettings.RequiredCaptionSuffix) ? "нет" : appSettings.RequiredCaptionSuffix));
             configTable.AddRow("#️⃣  Хэштеги (если своих нет)", Esc(string.IsNullOrWhiteSpace(appSettings.DefaultHashtags) ? "не дописываются" : appSettings.DefaultHashtags));
+            foreach (var page in pages.Where(p => !string.IsNullOrWhiteSpace(p.RequiredCaptionSuffix)))
+            {
+                configTable.AddRow($"✍️  Подпись {Esc(page.PageName)}", Esc(page.RequiredCaptionSuffix!));
+            }
             foreach (var page in pages.Where(p => !string.IsNullOrWhiteSpace(p.DefaultHashtags)))
             {
                 configTable.AddRow($"#️⃣  Хэштеги {Esc(page.PageName)}", Esc(page.DefaultHashtags!));
