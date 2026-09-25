@@ -596,7 +596,7 @@ namespace FacebookReelsPublisher
                             newVideo,
                             page.CustomCaption,
                             appSettings.RequiredCaptionSuffix,
-                            appSettings.DefaultHashtags);
+                            HashtagsFor(page, appSettings));
 
                         // Показываем итоговое описание целиком. Оно собирается из
                         // трёх кусков (текст, обязательная подпись, хэштеги), и без
@@ -762,6 +762,10 @@ namespace FacebookReelsPublisher
 
         private const int MaxSourceTextLength = 1500;
 
+        /// <summary>Хэштеги Страницы, если заданы, иначе общие.</summary>
+        static string HashtagsFor(FacebookPageSettings page, AppSettings appSettings) =>
+            string.IsNullOrWhiteSpace(page.DefaultHashtags) ? appSettings.DefaultHashtags : page.DefaultHashtags;
+
         // ─────────────────────────────────────────────────────────────────────
         //  Вывод настроек
         // ─────────────────────────────────────────────────────────────────────
@@ -792,6 +796,10 @@ namespace FacebookReelsPublisher
             configTable.AddRow("📤 Как отдаём файл", Esc(server.UploadMode));
             configTable.AddRow("✍️  Обязательная подпись", Esc(string.IsNullOrWhiteSpace(appSettings.RequiredCaptionSuffix) ? "нет" : appSettings.RequiredCaptionSuffix));
             configTable.AddRow("#️⃣  Хэштеги (если своих нет)", Esc(string.IsNullOrWhiteSpace(appSettings.DefaultHashtags) ? "не дописываются" : appSettings.DefaultHashtags));
+            foreach (var page in pages.Where(p => !string.IsNullOrWhiteSpace(p.DefaultHashtags)))
+            {
+                configTable.AddRow($"#️⃣  Хэштеги {Esc(page.PageName)}", Esc(page.DefaultHashtags!));
+            }
             configTable.AddRow("🚦 Лимит на Страницу за 24ч", $"{appSettings.Publishing.MaxPostsPerPagePerDay} (потолок Facebook: {appSettings.Publishing.ApiHardLimitPer24h})");
             configTable.AddRow("💾 История", "Последние 5 видео с timestamp");
 

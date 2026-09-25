@@ -61,6 +61,16 @@ namespace FacebookReelsPublisher.Models
 
         /// <summary>Экранная подпись (материальная трансформация). Пусто — без подписи.</summary>
         public string? OnScreenCaption { get; set; }
+
+        /// <summary>
+        /// Хэштеги этой Страницы вместо общих AppSettings.DefaultHashtags.
+        /// Нужны, когда Страницы на разных языках: общие хэштеги русские, а
+        /// англоязычной Странице «#мемы #приколы» вредят — по языку подписи
+        /// Facebook решает, кому показать ролик. Дописываются по тому же
+        /// правилу: только если в тексте ролика своих хэштегов нет.
+        /// Пусто — берутся общие.
+        /// </summary>
+        public string? DefaultHashtags { get; set; }
     }
 
     public class AppSettings
@@ -143,7 +153,7 @@ namespace FacebookReelsPublisher.Models
         public string PythonPath { get; set; } = "python3";
         public string ScriptPath { get; set; } = "/app/uniquify.py";
 
-        /// <summary>"crop" (макс. картинка) | "reframe" (клип на размытом фоне).</summary>
+        /// <summary>"crop" (кадр почти целиком, зум 2–3%) | "reframe" (клип на размытом фоне).</summary>
         public string Mode { get; set; } = "crop";
 
         /// <summary>"keep" | "strip" | "replace" | "mix".</summary>

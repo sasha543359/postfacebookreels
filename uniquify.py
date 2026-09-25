@@ -21,12 +21,20 @@ that can never go out. Trimming makes it publishable.
 
 WHAT THIS DOES (and what it does NOT):
   It defeats the CHEAP detectors: exact byte/MD5 hash, metadata correlation,
-  naive perceptual hash, cross-account audio-hash, and the TikTok-watermark
-  classifier. Ordered by detection layer (per research):
-    Layer 1  kill the TikTok watermark        -> edge-crop / reframe onto blurred bg
-    Layer 2  rework audio per-account         -> pitch/EQ, or replace/mix a bed
-    Layer 3  break perceptual hash            -> REAL 12-15% zoom/crop + micro-rotate
-    Layer 4  kill byte/metadata signature     -> re-encode, strip metadata, randomize params
+  cross-account audio-hash. Ordered by detection layer:
+    Layer 1  rework audio per-account         -> pitch/EQ, or replace/mix a bed
+    Layer 2  shift the picture                -> 2-3% zoom + micro-rotate, color, grain
+    Layer 3  kill byte/metadata signature     -> re-encode, strip metadata, randomize params
+
+  The zoom is deliberately SMALL. The Instagram build cut 5% off every edge and
+  then zoomed (12-15%, "to move a perceptual hash"), and on Facebook that ate
+  the picture: the Facebook app fills a tall phone screen with a 9:16 clip by
+  trimming about 5% off each side on its own. Stacked, the two pushed meme text
+  off the screen -- the caption line "Cuando encontraste snacks" lost its first
+  and last letters (reported from a live page, 25.09.2026; measured 1.22x
+  magnification against TikTok = 1.11 ours x 1.10 Facebook's). The edge
+  trim was there to cut the TikTok watermark, but yt-dlp downloads the
+  unwatermarked copy, so there was nothing to cut.
 
   It does NOT beat Instagram's account-level "aggregator/unoriginal" classifier
   (the thing behind a flat 300-400 view ceiling). That is decided at ACCOUNT level
@@ -41,24 +49,31 @@ Usage:
   python uniquify.py in.mp4 out.mp4 --profile acc2 --audio replace --audio-file bed.mp3
 Requires ffmpeg + ffprobe in PATH.
 """
-import argparse, hashlib, json, os, random, subprocess, sys
+import argparse, hashlib, json, math, os, random, subprocess, sys
 
-# Per-account signature. zoom = REAL 12-15% crop (research: <10% doesn't move a
-# robust perceptual hash). Color/speed/pitch stay subtle.
+# Per-account signature. Everything stays subtle, zoom included: 2-3% keeps a
+# clip's edge text on screen after Facebook's own ~5%-per-side phone crop (see
+# the note above). Don't push it back toward 10%+.
 PROFILES = {
-    "default": dict(speed=1.00, hue=0,  sat=1.00, bright=0.00, contrast=1.00, pitch=1.00, zoom=1.13),
-    "acc1":    dict(speed=1.03, hue=4,  sat=1.05, bright=0.02, contrast=1.03, pitch=1.02, zoom=1.14),
-    "acc2":    dict(speed=0.97, hue=-5, sat=0.97, bright=-0.02,contrast=1.02, pitch=0.98, zoom=1.12),
-    "acc3":    dict(speed=1.02, hue=7,  sat=1.03, bright=0.01, contrast=0.98, pitch=1.03, zoom=1.15),
-    "acc4":    dict(speed=0.98, hue=-3, sat=1.02, bright=-0.01,contrast=1.04, pitch=0.97, zoom=1.13),
-    "acc5":    dict(speed=1.01, hue=-7, sat=1.04, bright=0.015,contrast=1.01, pitch=1.01, zoom=1.14),
-    "acc6":    dict(speed=0.99, hue=6,  sat=0.98, bright=-0.015,contrast=1.03,pitch=0.99, zoom=1.12),
-    "acc7":    dict(speed=1.04, hue=-2, sat=1.06, bright=0.025,contrast=0.99, pitch=1.04, zoom=1.15),
-    "acc8":    dict(speed=0.96, hue=9,  sat=0.96, bright=-0.025,contrast=1.05,pitch=0.96, zoom=1.13),
-    "acc9":    dict(speed=1.02, hue=-9, sat=1.03, bright=0.01, contrast=1.02, pitch=1.03, zoom=1.14),
-    "acc10":   dict(speed=0.98, hue=3,  sat=1.01, bright=-0.01,contrast=0.98, pitch=0.98, zoom=1.12),
+    "default": dict(speed=1.00, hue=0,  sat=1.00, bright=0.00, contrast=1.00, pitch=1.00, zoom=1.025),
+    "acc1":    dict(speed=1.03, hue=4,  sat=1.05, bright=0.02, contrast=1.03, pitch=1.02, zoom=1.03),
+    "acc2":    dict(speed=0.97, hue=-5, sat=0.97, bright=-0.02,contrast=1.02, pitch=0.98, zoom=1.02),
+    "acc3":    dict(speed=1.02, hue=7,  sat=1.03, bright=0.01, contrast=0.98, pitch=1.03, zoom=1.03),
+    "acc4":    dict(speed=0.98, hue=-3, sat=1.02, bright=-0.01,contrast=1.04, pitch=0.97, zoom=1.025),
+    "acc5":    dict(speed=1.01, hue=-7, sat=1.04, bright=0.015,contrast=1.01, pitch=1.01, zoom=1.03),
+    "acc6":    dict(speed=0.99, hue=6,  sat=0.98, bright=-0.015,contrast=1.03,pitch=0.99, zoom=1.02),
+    "acc7":    dict(speed=1.04, hue=-2, sat=1.06, bright=0.025,contrast=0.99, pitch=1.04, zoom=1.03),
+    "acc8":    dict(speed=0.96, hue=9,  sat=0.96, bright=-0.025,contrast=1.05,pitch=0.96, zoom=1.025),
+    "acc9":    dict(speed=1.02, hue=-9, sat=1.03, bright=0.01, contrast=1.02, pitch=1.03, zoom=1.03),
+    "acc10":   dict(speed=0.98, hue=3,  sat=1.01, bright=-0.01,contrast=0.98, pitch=0.98, zoom=1.02),
 }
 W, H = 1080, 1920
+
+# Micro-rotation ceiling. The rotated frame has to cover the whole output, or
+# its corners show up black -- the old graph did exactly that. How much a tilt
+# can get away with depends on the zoom (see fit_rotation): at 1.02 the limit
+# is about 0.48 degrees, at 1.03 about 0.8.
+MAX_ROTATION_DEG = 0.5
 
 # Facebook Reels: 3-90 seconds. Anything longer is trimmed rather than skipped.
 MAX_DURATION = 90.0
@@ -103,6 +118,36 @@ def jit(base, amt, rng):
     return base + rng.uniform(-amt, amt)
 
 
+def even(x):
+    return int(round(x / 2)) * 2
+
+
+def fit_rotation(zw, zh, deg, margin=3):
+    """Largest tilt, up to `deg`, at which a zw x zh frame still covers the whole
+    W x H output once rotated -- so no black corner ever reaches the picture.
+    `margin` pixels of slack absorb the soft edge rotate's interpolation leaves."""
+    def covers(d):
+        a = math.radians(abs(d))
+        return (W / 2 * math.cos(a) + H / 2 * math.sin(a) <= zw / 2 - margin and
+                W / 2 * math.sin(a) + H / 2 * math.cos(a) <= zh / 2 - margin)
+    deg = math.trunc(deg * 100) / 100   # toward zero: rounding up could cross the limit
+    while abs(deg) > 0.01 and not covers(deg):
+        deg = math.trunc(deg * 90) / 100
+    return deg if covers(deg) else 0.0
+
+
+def zoom_rotate(zoom, rot):
+    """Filter chain: zoom the W x H frame by `zoom`, tilt it by `rot` degrees
+    inside that bigger canvas, cut the centre W x H back out. The corners that
+    rotate leaves black lie outside the cut (fit_rotation guarantees it) -- the
+    old chain rotated at 1:1 and let them into the corners of the picture."""
+    zw, zh = even(W * zoom), even(H * zoom)
+    chain = f"scale={zw}:{zh}"
+    if rot:
+        chain += f",rotate={rot}*PI/180:ow=iw:oh=ih:c=black"
+    return chain + f",crop={W}:{H}"
+
+
 def video_graph(prof, mode, caption, rng, font=""):
     """Return (graph_body, speed, chosen) where graph consumes [0:v] and yields [v]."""
     speed    = round(jit(prof["speed"], 0.012, rng), 3)
@@ -110,28 +155,37 @@ def video_graph(prof, mode, caption, rng, font=""):
     sat      = round(jit(prof["sat"], 0.02, rng), 3)
     bright   = round(jit(prof["bright"], 0.012, rng), 3)
     contrast = round(jit(prof["contrast"], 0.015, rng), 3)
-    zoom     = round(jit(prof["zoom"], 0.01, rng), 3)
-    rot      = round(rng.uniform(-0.8, 0.8), 2)
+    zoom     = round(jit(prof["zoom"], 0.004, rng), 3)
+    rot      = fit_rotation(even(W * zoom), even(H * zoom),
+                            rng.uniform(-MAX_ROTATION_DEG, MAX_ROTATION_DEG))
 
-    common = (f"rotate={rot}*PI/180:ow=rotw({rot}*PI/180):oh=roth({rot}*PI/180),crop={W}:{H},"
-              f"eq=brightness={bright}:contrast={contrast}:saturation={sat},hue=h={hue},"
-              f"noise=alls=4:allf=t+u")
+    # Speed and frame rate go FIRST, not last. The output is 30 fps either way,
+    # but TikTok serves plenty of 60 fps clips, and with fps=30 at the end
+    # every filter below chewed through twice the frames only for half of them
+    # to be dropped. On the 1-vCPU droplet that decided whether a clip made the
+    # timeout (16.7 s at 1080p60: 252 s against a 180 s limit, 18.09.2026).
+    head = f"setpts={round(1/speed,4)}*PTS,fps=30"
+
+    tail = (f"eq=brightness={bright}:contrast={contrast}:saturation={sat},hue=h={hue},"
+            f"noise=alls=4:allf=t+u")
     if caption:
         ff = f"fontfile='{esc(font)}':" if font else ""
-        common += (f",drawtext={ff}text='{esc(caption)}':fontcolor=white:fontsize=64:borderw=4:"
-                   f"bordercolor=black@0.9:x=(w-text_w)/2:y=h*0.11:line_spacing=8")
-    common += f",setpts={round(1/speed,4)}*PTS,fps=30"
+        tail += (f",drawtext={ff}text='{esc(caption)}':fontcolor=white:fontsize=64:borderw=4:"
+                 f"bordercolor=black@0.9:x=(w-text_w)/2:y=h*0.11:line_spacing=8")
+    # Square pixels, stated outright. The scale steps round to even sizes and
+    # carry the rounding into the sample aspect ratio; a clip flagged as
+    # 1079:1080 is a clip some player somewhere stretches.
+    tail += ",setsar=1"
 
+    fill = f"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H}"
     if mode == "reframe":
         # zoom-crop the core, composite onto a blurred scaled copy -> fresh border pixels
-        body = (f"[0:v]scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},split=2[bg][fg];"
+        body = (f"[0:v]{head},{fill},split=2[bg][fg];"
                 f"[bg]scale={W}:{H},boxblur=28:2,eq=brightness=-0.06[bgb];"
                 f"[fg]crop=iw*0.80:ih*0.80:iw*0.10:ih*0.10,scale=iw*0.86:-2[fgs];"
-                f"[bgb][fgs]overlay=(W-w)/2:(H-h)/2,{common}[v]")
-    else:  # crop: real zoom-crop, edge trim removes watermark band
-        body = (f"[0:v]scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},"
-                f"crop=iw*0.93:ih*0.90:iw*0.035:ih*0.05,scale=iw*{zoom}:-2,"
-                f"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},{common}[v]")
+                f"[bgb][fgs]overlay=(W-w)/2:(H-h)/2,{zoom_rotate(zoom, rot)},{tail}[v]")
+    else:  # crop: the whole frame, a hair bigger and tilted (see PROFILES)
+        body = f"[0:v]{head},{fill},{zoom_rotate(zoom, rot)},{tail}[v]"
     chosen = dict(speed=speed, hue=hue, sat=sat, bright=bright, contrast=contrast,
                   zoom=zoom, rot=rot, mode=mode, caption=bool(caption))
     return body, speed, chosen
