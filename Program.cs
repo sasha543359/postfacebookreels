@@ -80,6 +80,7 @@ namespace FacebookReelsPublisher
                     serviceProvider,
                     tiktokMonitor,
                     pages,
+                    appSettings,
                     server,
                     args.Where(a => !a.StartsWith('-')).ToArray(),
                     download: args.Any(a => a == "--download"));
@@ -258,6 +259,7 @@ namespace FacebookReelsPublisher
             IServiceProvider serviceProvider,
             ITikTokMonitorService monitor,
             List<FacebookPageSettings> pages,
+            AppSettings appSettings,
             ServerSettings server,
             string[] names,
             bool download)
@@ -290,6 +292,30 @@ namespace FacebookReelsPublisher
             }
 
             AnsiConsole.Write(fbTable);
+
+            // ── Описание ─────────────────────────────────────────────────────
+            // Готовое описание каждой Страницы: правку CustomCaption, подписи
+            // или хэштегов видно до первой публикации, а не после неё.
+            foreach (var page in pages.Where(p => p.NotReadyReason == null))
+            {
+                var sample = new TikTokVideo { Title = "‹текст ролика из TikTok›" };
+                var description = BuildDescription(
+                    sample,
+                    page.CustomCaption,
+                    appSettings.RequiredCaptionSuffix,
+                    HashtagsFor(page, appSettings));
+
+                AnsiConsole.MarkupLine($"\n[cyan]Описание под роликами {Esc(page.PageName)}:[/]");
+                foreach (var line in description.Split('\n'))
+                {
+                    AnsiConsole.MarkupLine($"[grey]   │[/] {Esc(line)}");
+                }
+
+                if (string.IsNullOrWhiteSpace(page.CustomCaption))
+                {
+                    AnsiConsole.MarkupLine("[grey]   (хэштеги дописываются, только если в тексте ролика своих нет)[/]");
+                }
+            }
 
             // ── TikTok ───────────────────────────────────────────────────────
             // Авторов выключенных Страниц не проверяем: в шаблоне у второй
@@ -751,12 +777,16 @@ namespace FacebookReelsPublisher
         // ─────────────────────────────────────────────────────────────────────
 
         /// <summary>
-        /// Собирает описание: текст, обязательная подпись, хэштеги.
+        /// Собирает описание: обязательная подпись, текст, хэштеги.
         ///
         /// Обязательная подпись (RequiredCaptionSuffix, по умолчанию
         /// «Twitch: MELLSTROY») добавляется ВСЕГДА — и к описанию исходного
-        /// ролика, и к CustomCaption. Единственное исключение: если она уже есть
-        /// в тексте, второй раз не дублируется.
+        /// ролика, и к CustomCaption — и идёт ПЕРВОЙ строкой: Facebook под
+        /// роликом показывает только начало описания, остальное прячет за
+        /// «…ещё», а реклама канала должна быть видна сразу. Так попросил
+        /// владелец 25.09.2026 («описание после твича, потом теги»); раньше
+        /// строка шла в конце — отсюда «Suffix» в названии настройки.
+        /// Если строка уже есть в тексте, второй раз не добавляется.
         /// </summary>
         static string BuildDescription(TikTokVideo video, string? customCaption, string? requiredSuffix, string? defaultHashtags)
         {
@@ -772,15 +802,15 @@ namespace FacebookReelsPublisher
 
             var parts = new List<string>();
 
-            if (text.Length > 0)
-            {
-                parts.Add(text);
-            }
-
             var suffix = (requiredSuffix ?? string.Empty).Trim();
             if (suffix.Length > 0 && text.IndexOf(suffix, StringComparison.OrdinalIgnoreCase) < 0)
             {
                 parts.Add(suffix);
+            }
+
+            if (text.Length > 0)
+            {
+                parts.Add(text);
             }
 
             var hashtags = (defaultHashtags ?? string.Empty).Trim();
