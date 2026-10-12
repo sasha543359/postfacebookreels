@@ -28,8 +28,20 @@ namespace FacebookReelsPublisher.Services
         /// <summary>Последние ролики автора (до 5 штук).</summary>
         Task<List<TikTokVideo>> GetLatestVideos(string username);
 
-        /// <summary>Есть ли у автора ролик, которого ещё не публиковали по этому ключу истории.</summary>
+        /// <summary>Есть ли у автора ролик, которого ещё не публиковали по этому ключу истории (самый свежий).</summary>
         Task<TikTokVideo?> CheckForNewVideo(string username, string historyKey);
+
+        /// <summary>Все ещё не опубликованные ролики автора по этому ключу истории — от старых к новым.</summary>
+        Task<List<TikTokVideo>> GetNewVideos(string username, string historyKey);
+
+        /// <summary>Сколько минут ждать HD-версию свежего ролика (0 — не ждать).</summary>
+        int WaitForHdMinutes { get; }
+
+        /// <summary>Пора ли скачивать ролик или подождать, пока TikTok сделает его HD-версию.</summary>
+        Task<HdCheck> CheckHdAsync(TikTokVideo video);
+
+        /// <summary>Лучший вариант ролика, который TikTok отдаёт прямо сейчас (без скачивания); null — узнать не вышло.</summary>
+        Task<MediaInfo?> ProbeBestQualityAsync(TikTokVideo video);
 
         /// <summary>Скачать ролик.</summary>
         Task<string> DownloadVideo(TikTokVideo video, string? customPath = null);
@@ -62,6 +74,16 @@ namespace FacebookReelsPublisher.Services
         /// суточную квоту в 30 публикаций.
         /// </summary>
         Task<string> EnsureReelsDurationAsync(string path);
+
+        /// <summary>
+        /// Растягивает до 1080x1920 файл, который меньше: такой Facebook
+        /// помечает в статистике ролика как «нет высокого разрешения».
+        ///
+        /// Работает ВСЕГДА, как и подрезка: меньше 1080x1920 в Facebook уходит
+        /// именно тогда, когда уникализатор выключен, не успел или упал, — и
+        /// исходник свежего ролика из TikTok всего 576x1024.
+        /// </summary>
+        Task<string> EnsureReelsResolutionAsync(string path);
 
         /// <summary>Включён ли уникализатор.</summary>
         bool Enabled { get; }

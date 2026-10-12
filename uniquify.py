@@ -23,7 +23,7 @@ WHAT THIS DOES (and what it does NOT):
   It defeats the CHEAP detectors: exact byte/MD5 hash, metadata correlation,
   cross-account audio-hash. Ordered by detection layer:
     Layer 1  rework audio per-account         -> pitch/EQ, or replace/mix a bed
-    Layer 2  shift the picture                -> 2-3% zoom + micro-rotate, color, grain
+    Layer 2  shift the picture                -> 2-3% zoom + off-centre crop, color
     Layer 3  kill byte/metadata signature     -> re-encode, strip metadata, randomize params
 
   The zoom is deliberately SMALL. The Instagram build cut 5% off every edge and
@@ -49,7 +49,7 @@ Usage:
   python uniquify.py in.mp4 out.mp4 --profile acc2 --audio replace --audio-file bed.mp3
 Requires ffmpeg + ffprobe in PATH.
 """
-import argparse, hashlib, json, math, os, random, subprocess, sys
+import argparse, hashlib, json, os, random, subprocess, sys
 
 # Per-account signature. Everything stays subtle, zoom included: 2-3% keeps a
 # clip's edge text on screen after Facebook's own ~5%-per-side phone crop (see
@@ -69,11 +69,17 @@ PROFILES = {
 }
 W, H = 1080, 1920
 
-# Micro-rotation ceiling. The rotated frame has to cover the whole output, or
-# its corners show up black -- the old graph did exactly that. How much a tilt
-# can get away with depends on the zoom (see fit_rotation): at 1.02 the limit
-# is about 0.48 degrees, at 1.03 about 0.8.
-MAX_ROTATION_DEG = 0.5
+# How far the crop may move off-centre, as a share of the margin the zoom
+# leaves on that side. This replaced the old micro-rotation (<=0.5 degrees),
+# which did the same job -- put the picture on a grid that is not the
+# original's -- at a ruinous price: `rotate` was by far the most expensive
+# filter in the chain. Single-threaded on a 42 s 576x1024 clip the chain took
+# 33.9 s with it and 2.0 s without (12.10.2026); on the $6 droplet the whole
+# script needed 446 s for that clip against a 180-300 s timeout, so long clips
+# never made it and went out raw at 576x1024. Rotation also resampled every
+# pixel a second time (bilinear), which softened the picture. A shifted crop
+# costs nothing: it moves whole pixels and resamples nothing.
+MAX_SHIFT = 0.8
 
 # Facebook Reels: 3-90 seconds. Anything longer is trimmed rather than skipped.
 MAX_DURATION = 90.0
@@ -82,6 +88,41 @@ MIN_DURATION = 3.0
 # frame/packet boundary rather than the exact mark, and overshooting 90.0 by a
 # few hundredths is enough for Facebook to reject the clip (error 1363128).
 TRIM_TARGET = 89.5
+
+
+# x264 presets, slowest (smallest file at a given crf) first, with the seconds
+# of work each takes per second of OUTPUT on the $6 DigitalOcean droplet
+# (1 vCPU) through this filter chain at 1080x1920/30. That droplet is the
+# slowest machine this runs on, so the table only has to be right for it --
+# a faster server just finishes early.
+#
+# Measured there 12.10.2026 (whole script, app idle): a 42 s 576x1024 stream
+# clip -- ultrafast 1.2, veryfast 3.5, faster 5.9, fast 7.9 s per second; a
+# 21 s 1080p60 meme -- fast 4.0, medium 5.4. Stream clips cost about twice
+# what memes do, so the table follows the stream clip, medium extrapolated.
+#
+# Why the preset follows the clock at all: the service gives the script
+# TimeoutSeconds (300 in the template; friends' older configs say 180) and
+# publishes the raw download if it runs over. Before 12.10.2026 the preset
+# was always fast or medium, and a 42 s stream clip took 446 s on the droplet
+# -- every long clip went out raw, at TikTok's 576x1024, which Facebook flags
+# as low resolution. The quality price of a faster preset is small next to
+# that: veryfast at crf 18 measured within ~0.5 VMAF of fast at crf 20.
+PRESET_COST = (("medium", 11.0), ("fast", 8.0), ("faster", 6.0), ("veryfast", 3.6), ("ultrafast", 1.2))
+BUDGET_SHARE = 0.75   # headroom: probe, audio, muxing, a busier CPU than measured
+
+
+def pick_preset(rng, out_dur, budget):
+    """The slowest preset expected to finish `out_dur` seconds of output within
+    `budget` seconds. No budget (a run by hand) -- fast or medium, as always.
+    None -- even the fastest would not make it."""
+    if not budget:
+        return rng.choice(["fast", "medium"])
+    fits = [name for name, cost in PRESET_COST if out_dur * cost <= budget * BUDGET_SHARE]
+    if not fits:
+        return None
+    # Short clips keep the old per-file variety between medium and fast.
+    return rng.choice(fits[:2]) if fits[0] == "medium" else fits[0]
 
 
 def run(cmd):
@@ -122,30 +163,18 @@ def even(x):
     return int(round(x / 2)) * 2
 
 
-def fit_rotation(zw, zh, deg, margin=3):
-    """Largest tilt, up to `deg`, at which a zw x zh frame still covers the whole
-    W x H output once rotated -- so no black corner ever reaches the picture.
-    `margin` pixels of slack absorb the soft edge rotate's interpolation leaves."""
-    def covers(d):
-        a = math.radians(abs(d))
-        return (W / 2 * math.cos(a) + H / 2 * math.sin(a) <= zw / 2 - margin and
-                W / 2 * math.sin(a) + H / 2 * math.cos(a) <= zh / 2 - margin)
-    deg = math.trunc(deg * 100) / 100   # toward zero: rounding up could cross the limit
-    while abs(deg) > 0.01 and not covers(deg):
-        deg = math.trunc(deg * 90) / 100
-    return deg if covers(deg) else 0.0
+def zoom_shift(zoom, sx, sy):
+    """Filter chain: scale the clip to cover W*zoom x H*zoom in ONE pass, then cut
+    W x H out of it, moved off-centre by sx / sy (each in -1..1, a share of the
+    margin the zoom leaves on that side).
 
-
-def zoom_rotate(zoom, rot):
-    """Filter chain: zoom the W x H frame by `zoom`, tilt it by `rot` degrees
-    inside that bigger canvas, cut the centre W x H back out. The corners that
-    rotate leaves black lie outside the cut (fit_rotation guarantees it) -- the
-    old chain rotated at 1:1 and let them into the corners of the picture."""
+    One scale instead of two ("fill to W x H", then "zoom") -- every resample
+    softens the picture a little. lanczos instead of the default bicubic: the
+    clip is often a 576x1024 TikTok file blown up 1.9x, and lanczos keeps
+    noticeably more of it (VMAF against the real 1080p: see CLAUDE.md)."""
     zw, zh = even(W * zoom), even(H * zoom)
-    chain = f"scale={zw}:{zh}"
-    if rot:
-        chain += f",rotate={rot}*PI/180:ow=iw:oh=ih:c=black"
-    return chain + f",crop={W}:{H}"
+    return (f"scale={zw}:{zh}:force_original_aspect_ratio=increase:force_divisible_by=2:flags=lanczos,"
+            f"crop={W}:{H}:x='(iw-ow)/2*(1+{sx})':y='(ih-oh)/2*(1+{sy})'")
 
 
 def video_graph(prof, mode, caption, rng, font=""):
@@ -156,8 +185,8 @@ def video_graph(prof, mode, caption, rng, font=""):
     bright   = round(jit(prof["bright"], 0.012, rng), 3)
     contrast = round(jit(prof["contrast"], 0.015, rng), 3)
     zoom     = round(jit(prof["zoom"], 0.004, rng), 3)
-    rot      = fit_rotation(even(W * zoom), even(H * zoom),
-                            rng.uniform(-MAX_ROTATION_DEG, MAX_ROTATION_DEG))
+    sx       = round(rng.uniform(-MAX_SHIFT, MAX_SHIFT), 2)
+    sy       = round(rng.uniform(-MAX_SHIFT, MAX_SHIFT), 2)
 
     # Speed and frame rate go FIRST, not last. The output is 30 fps either way,
     # but TikTok serves plenty of 60 fps clips, and with fps=30 at the end
@@ -166,8 +195,12 @@ def video_graph(prof, mode, caption, rng, font=""):
     # timeout (16.7 s at 1080p60: 252 s against a 180 s limit, 18.09.2026).
     head = f"setpts={round(1/speed,4)}*PTS,fps=30"
 
-    tail = (f"eq=brightness={bright}:contrast={contrast}:saturation={sat},hue=h={hue},"
-            f"noise=alls=4:allf=t+u")
+    # No grain any more (there was noise=alls=4:allf=t+u). Against TikTok's own
+    # 1080p it cost 0.1-0.6 VMAF and 11-21% bitrate, and after a fixed-bitrate
+    # re-encode -- what Facebook does to every upload -- up to 1.2 VMAF: the
+    # encoder spends its bits on the grain instead of the picture. Strength 2
+    # was no compromise, within 0.1-0.3 of 4 after the re-encode (12.10.2026).
+    tail = f"eq=brightness={bright}:contrast={contrast}:saturation={sat},hue=h={hue}"
     if caption:
         ff = f"fontfile='{esc(font)}':" if font else ""
         tail += (f",drawtext={ff}text='{esc(caption)}':fontcolor=white:fontsize=64:borderw=4:"
@@ -177,17 +210,17 @@ def video_graph(prof, mode, caption, rng, font=""):
     # 1079:1080 is a clip some player somewhere stretches.
     tail += ",setsar=1"
 
-    fill = f"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H}"
     if mode == "reframe":
         # zoom-crop the core, composite onto a blurred scaled copy -> fresh border pixels
+        fill = f"scale={W}:{H}:force_original_aspect_ratio=increase:flags=lanczos,crop={W}:{H}"
         body = (f"[0:v]{head},{fill},split=2[bg][fg];"
                 f"[bg]scale={W}:{H},boxblur=28:2,eq=brightness=-0.06[bgb];"
-                f"[fg]crop=iw*0.80:ih*0.80:iw*0.10:ih*0.10,scale=iw*0.86:-2[fgs];"
-                f"[bgb][fgs]overlay=(W-w)/2:(H-h)/2,{zoom_rotate(zoom, rot)},{tail}[v]")
-    else:  # crop: the whole frame, a hair bigger and tilted (see PROFILES)
-        body = f"[0:v]{head},{fill},{zoom_rotate(zoom, rot)},{tail}[v]"
+                f"[fg]crop=iw*0.80:ih*0.80:iw*0.10:ih*0.10,scale=iw*0.86:-2:flags=lanczos[fgs];"
+                f"[bgb][fgs]overlay=(W-w)/2:(H-h)/2,{zoom_shift(zoom, sx, sy)},{tail}[v]")
+    else:  # crop: the whole frame, a hair bigger and a hair off-centre (see PROFILES)
+        body = f"[0:v]{head},{zoom_shift(zoom, sx, sy)},{tail}[v]"
     chosen = dict(speed=speed, hue=hue, sat=sat, bright=bright, contrast=contrast,
-                  zoom=zoom, rot=rot, mode=mode, caption=bool(caption))
+                  zoom=zoom, shift=[sx, sy], mode=mode, caption=bool(caption))
     return body, speed, chosen
 
 
@@ -229,6 +262,9 @@ def main():
     ap.add_argument("--audio", choices=["keep", "strip", "replace", "mix"], default="keep")
     ap.add_argument("--audio-file", default="")
     ap.add_argument("--seed", type=int, default=None)
+    ap.add_argument("--budget", type=float, default=0,
+                    help="seconds the caller will wait; picks an x264 preset that fits (0 = no limit)")
+    ap.add_argument("--preset", default="", help="force an x264 preset (testing)")
     args = ap.parse_args()
 
     prof = PROFILES.get(args.profile, PROFILES["default"])
@@ -242,14 +278,30 @@ def main():
     vbody, speed, chosen = video_graph(prof, args.mode, args.caption, rng, font)
     abody, has_audio = audio_graph(prof, meta, speed, args.audio, has_bed, rng)
 
-    crf = rng.choice([19, 20, 21, 22, 23])
-    preset = rng.choice(["fast", "medium"])   # server-friendly; still good compression
-    gop = rng.choice([48, 60, 72])
-
     # Duration after the speed change -- setpts/atempo stretch or squeeze the clip,
     # so the cap has to be checked against the OUTPUT length, not the source.
     out_dur = meta["dur"] / speed if speed else meta["dur"]
     trim_to = TRIM_TARGET if out_dur > MAX_DURATION else None
+
+    work_dur = min(out_dur, TRIM_TARGET)
+    preset = args.preset or pick_preset(rng, work_dur, args.budget)
+    if preset is None:
+        # Better to say so in a second than to burn the whole timeout and be
+        # killed: the service then publishes the clip as is, upscaled to 1080x1920.
+        print(json.dumps({"dst": args.dst, "profile": args.profile, "seed": args.seed,
+                          "problems": [f"{work_dur:.1f}s of output won't fit a {args.budget:.0f}s budget"]},
+                         ensure_ascii=False, indent=2))
+        sys.exit(3)
+
+    # 19-21, not 19-23: crf 23 against 20 measured about -1 VMAF, and Facebook
+    # re-encodes whatever we send -- a cleaner master survives that better.
+    # faster/veryfast spend fewer bits at the same crf; two steps lower puts
+    # them back (veryfast crf 18 measured within 0.5 VMAF of fast crf 20).
+    crf = rng.choice([19, 20, 21]) - (2 if preset in ("faster", "veryfast") else 0)
+
+    # Keyframe every 2-3 s: Facebook's Reels spec recommends a closed GOP of 2-5 s
+    # (x264 GOPs are closed by default).
+    gop = rng.choice([60, 75, 90])
 
     graph = vbody + ((";" + abody) if abody else "")
     cmd = ["ffmpeg", "-y", "-i", args.src]

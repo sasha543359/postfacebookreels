@@ -56,6 +56,10 @@ namespace FacebookReelsPublisher.Services
             psi.ArgumentList.Add("--profile"); psi.ArgumentList.Add(profile ?? "default");
             psi.ArgumentList.Add("--mode"); psi.ArgumentList.Add(_settings.Mode);
             psi.ArgumentList.Add("--audio"); psi.ArgumentList.Add(_settings.Audio);
+            // Сколько ждём — скрипт по этому выбирает пресет x264, чтобы
+            // уложиться: длинный ролик сжимается быстрее, чем короткий мем.
+            psi.ArgumentList.Add("--budget");
+            psi.ArgumentList.Add(_settings.TimeoutSeconds.ToString(System.Globalization.CultureInfo.InvariantCulture));
             if (!string.IsNullOrWhiteSpace(_settings.Font))
             {
                 psi.ArgumentList.Add("--font"); psi.ArgumentList.Add(_settings.Font);
@@ -74,8 +78,9 @@ namespace FacebookReelsPublisher.Services
             {
                 using var process = new Process { StartInfo = psi };
                 var err = new System.Text.StringBuilder();
+                var report = new System.Text.StringBuilder();
                 process.ErrorDataReceived += (_, e) => { if (e.Data != null) err.AppendLine(e.Data); };
-                process.OutputDataReceived += (_, e) => { /* JSON-отчёт скрипта нам не нужен построчно */ };
+                process.OutputDataReceived += (_, e) => { if (e.Data != null) report.AppendLine(e.Data); };
 
                 process.Start();
                 process.BeginOutputReadLine();
@@ -98,6 +103,17 @@ namespace FacebookReelsPublisher.Services
                     return inputPath;
                 }
 
+                // Код 3 — скрипт сам прикинул, что не уложится в таймаут даже на
+                // самом быстром пресете, и не стал начинать (pick_preset в
+                // uniquify.py). Это не сбой: ролик уйдёт без уникализации, а
+                // EnsureReelsResolutionAsync растянет его до 1080x1920.
+                if (process.ExitCode == 3)
+                {
+                    TryDelete(outputPath);
+                    _logger.LogWarning($"   ⏱️ Ролик слишком длинный, чтобы уникализировать его за {_settings.TimeoutSeconds}с — публикуем без уникализации.");
+                    return inputPath;
+                }
+
                 if (process.ExitCode != 0 || !File.Exists(outputPath))
                 {
                     TryDelete(outputPath);
@@ -105,7 +121,12 @@ namespace FacebookReelsPublisher.Services
                     return inputPath;
                 }
 
-                _logger.LogInformation($"   ✅ Уникализировано: {Path.GetFileName(outputPath)}");
+                // Какой пресет скрипт выбрал под таймаут — пригодится, когда
+                // будут спрашивать, почему один ролик сжат иначе, чем другой.
+                var encode = System.Text.RegularExpressions.Regex.Match(
+                    report.ToString(), "\"crf\":\\s*(\\d+),\\s*\"preset\":\\s*\"(\\w+)\"");
+                _logger.LogInformation($"   ✅ Уникализировано: {Path.GetFileName(outputPath)}" +
+                                       (encode.Success ? $" (x264 {encode.Groups[2].Value}, crf {encode.Groups[1].Value})" : string.Empty));
                 return outputPath;
             }
             catch (Exception ex)
@@ -216,7 +237,85 @@ namespace FacebookReelsPublisher.Services
                 : 0;
         }
 
-        private static async Task<bool> RunAsync(string file, string[] arguments)
+        // ─────────────────────────────────────────────────────────────────────
+        //  Разрешение под Reels
+        // ─────────────────────────────────────────────────────────────────────
+
+        /// <summary>
+        /// Пресет x264 для растяжки. Растяжка срабатывает как раз тогда, когда
+        /// на тяжёлую работу времени не осталось: уникализатор выключен, упал
+        /// или не уложился в таймаут — а это длинные ролики на сервере с одним
+        /// ядром. Поэтому быстрый пресет, а качество держит crf.
+        /// </summary>
+        private const string UpscalePreset = "veryfast";
+
+        /// <summary>
+        /// Потолок на растяжку. Не уложилась — публикуем как есть: ролик в
+        /// 576x1024 лучше, чем никакого.
+        /// </summary>
+        private const int UpscaleTimeoutSeconds = 600;
+
+        public async Task<string> EnsureReelsResolutionAsync(string path)
+        {
+            try
+            {
+                if (!File.Exists(path)) return path;
+
+                var info = await MediaProbe.ProbeAsync(path);
+
+                // Не прочиталось — растягивать вслепую нельзя, пусть решает Facebook.
+                if (info == null || info.ShortSide >= HdWaitPolicy.FullHdSide) return path;
+
+                var dir = Path.GetDirectoryName(path) ?? ".";
+                var upscaled = Path.Combine(dir, Path.GetFileNameWithoutExtension(path) + "_1080.mp4");
+
+                _logger.LogInformation(
+                    $"   🔍 Файл {info.Width}×{info.Height} — меньше 1080×1920: Facebook пометит такой ролик " +
+                    "как «нет высокого разрешения». Растягиваем до 1080×1920...");
+
+                var stopwatch = Stopwatch.StartNew();
+
+                // Кадрирование то же, что у уникализатора: вертикальный ролик
+                // просто растягивается, у ролика с другими пропорциями срезаются
+                // края — чёрные поля Facebook тоже считает недостатком.
+                // lanczos вместо bicubic по умолчанию: при растяжке почти вдвое
+                // картинка у него чётче (+1…1,4 VMAF, замер 12.10.2026).
+                // Больше 30 к/с не нужно — уникализатор тоже отдаёт 30, а
+                // 60-кадровый ролик растягивался бы почти вдвое дольше.
+                var filters = (info.Fps > 30.5 ? "fps=30," : string.Empty) +
+                              "scale=1080:1920:force_original_aspect_ratio=increase:flags=lanczos,crop=1080:1920,setsar=1";
+
+                var ok = await RunAsync("ffmpeg", new[]
+                {
+                    "-y", "-i", path,
+                    "-vf", filters,
+                    "-c:v", "libx264", "-preset", UpscalePreset, "-crf", "20",
+                    "-profile:v", "high", "-pix_fmt", "yuv420p",
+                    "-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "2",
+                    "-map_metadata", "-1", "-movflags", "+faststart",
+                    upscaled
+                }, TimeSpan.FromSeconds(UpscaleTimeoutSeconds));
+
+                if (!ok || !File.Exists(upscaled) || new FileInfo(upscaled).Length < 10 * 1024)
+                {
+                    TryDelete(upscaled);
+                    _logger.LogWarning($"   ⚠️  Растянуть не вышло — публикуем {info.Width}×{info.Height} как есть");
+                    return path;
+                }
+
+                TryDelete(path);
+                _logger.LogInformation($"   ✅ Растянуто до 1080×1920 за {stopwatch.Elapsed.TotalSeconds:F0} с");
+                return upscaled;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning($"   ⚠️  Проверка разрешения не удалась ({ex.Message}) — отдаём как есть");
+                return path;
+            }
+        }
+
+        /// <param name="timeout">null — ждать сколько угодно. Не уложился — процесс снимается, ответ false.</param>
+        private static async Task<bool> RunAsync(string file, string[] arguments, TimeSpan? timeout = null)
         {
             var psi = new ProcessStartInfo
             {
@@ -237,8 +336,18 @@ namespace FacebookReelsPublisher.Services
             var stdout = process.StandardOutput.ReadToEndAsync();
             var stderr = process.StandardError.ReadToEndAsync();
 
+            using var cts = timeout.HasValue ? new CancellationTokenSource(timeout.Value) : new CancellationTokenSource();
+            try
+            {
+                await process.WaitForExitAsync(cts.Token);
+            }
+            catch (OperationCanceledException)
+            {
+                try { process.Kill(true); process.WaitForExit(5000); } catch { }
+                return false;
+            }
+
             await Task.WhenAll(stdout, stderr);
-            await process.WaitForExitAsync();
 
             return process.ExitCode == 0;
         }

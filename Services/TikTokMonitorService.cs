@@ -357,6 +357,66 @@ namespace FacebookReelsPublisher.Services
 
         public async Task<TikTokVideo?> CheckForNewVideo(string username, string historyKey)
         {
+            var (fresh, latestTimestamp) = await FindNewVideos(username, historyKey);
+
+            // Лента отдаёт ролики от свежих к старым: первый — самый новый.
+            var video = fresh.FirstOrDefault();
+            if (video != null)
+            {
+                LogNewVideo(video, latestTimestamp);
+            }
+
+            return video;
+        }
+
+        /// <summary>
+        /// Все ещё не опубликованные ролики автора — от старых к новым.
+        ///
+        /// Нужен режиму ожидания HD. CheckForNewVideo отдаёт только самый
+        /// свежий ролик, а остальные новые после его публикации оказываются
+        /// старше последнего в истории и пропадают. Пока ролики публиковались
+        /// сразу, так терялся только второй из двух, вышедших между соседними
+        /// проверками, — редкость. С ожиданием до двух часов у активного автора
+        /// следующий ролик выходит почти всегда, пока ждёт предыдущий: брать
+        /// самый свежий значило бы вечно ждать и терять. Поэтому при ожидании
+        /// берём старший — опубликованный, он не отсекает младших, они идут
+        /// следом.
+        /// </summary>
+        public async Task<List<TikTokVideo>> GetNewVideos(string username, string historyKey)
+        {
+            var (fresh, latestTimestamp) = await FindNewVideos(username, historyKey);
+            var ordered = fresh.OrderBy(v => v.Timestamp).ToList();
+
+            // Без «🎉 Найдено НОВОЕ видео»: ролик может ещё ждать HD и попадаться
+            // здесь несколько кругов подряд — праздновать каждый раз нечего.
+            if (ordered.Count > 0)
+            {
+                _logger.LogInformation(
+                    $"   Неопубликованных роликов: {ordered.Count}, на очереди {ordered[0].Id} " +
+                    $"(timestamp {ordered[0].Timestamp}, последний в истории: {latestTimestamp})");
+            }
+
+            return ordered;
+        }
+
+        private void LogNewVideo(TikTokVideo video, long latestTimestamp)
+        {
+            _logger.LogInformation($"   🎉 Найдено НОВОЕ видео!");
+            _logger.LogInformation($"      Название: {video.Title}");
+            _logger.LogInformation($"      ID: {video.Id}");
+            _logger.LogInformation($"      Timestamp: {video.Timestamp} (последний в истории: {latestTimestamp})");
+        }
+
+        /// <summary>
+        /// Ролики автора, которых нет в истории ключа и которые новее последнего
+        /// из неё, — в порядке ленты, то есть свежие первыми. Пустой список —
+        /// новых нет, лента не прочиталась или это первый запуск для ключа
+        /// (тогда история заводится, а публиковать нечего).
+        /// </summary>
+        private async Task<(List<TikTokVideo> Fresh, long LatestTimestamp)> FindNewVideos(string username, string historyKey)
+        {
+            var none = (new List<TikTokVideo>(), 0L);
+
             try
             {
                 _logger.LogInformation($"   Проверяем новые видео у @{username} (история: {historyKey})");
@@ -368,7 +428,7 @@ namespace FacebookReelsPublisher.Services
                 if (videoList.Count == 0)
                 {
                     _logger.LogInformation("   Видео не найдены (аккаунт может не существовать или изменил ник)");
-                    return null;
+                    return none;
                 }
 
                 // Если ключа нет в истории - первый запуск для этой пары
@@ -388,38 +448,157 @@ namespace FacebookReelsPublisher.Services
                     SaveHistory();
 
                     _logger.LogInformation($"   ✅ История инициализирована, следующие видео будут публиковаться");
-                    return null; // НЕ публикуем при первом запуске
+                    return none; // НЕ публикуем при первом запуске
                 }
 
                 var accountHistory = _accountHistories[historyKey];
                 var latestTimestamp = accountHistory.GetLatestTimestamp();
 
-                // Проверяем каждое видео
-                foreach (var video in videoList)
-                {
-                    // Условия для публикации:
-                    // 1. ID НЕТ в истории
-                    // 2. Timestamp БОЛЬШЕ самого свежего в истории (защита от старых видео)
-                    if (!accountHistory.ContainsVideo(video.Id) && video.Timestamp > latestTimestamp)
-                    {
-                        _logger.LogInformation($"   🎉 Найдено НОВОЕ видео!");
-                        _logger.LogInformation($"      Название: {video.Title}");
-                        _logger.LogInformation($"      ID: {video.Id}");
-                        _logger.LogInformation($"      Timestamp: {video.Timestamp} (последний в истории: {latestTimestamp})");
+                // Условия для публикации:
+                // 1. ID НЕТ в истории
+                // 2. Timestamp БОЛЬШЕ самого свежего в истории (защита от старых видео)
+                var fresh = videoList
+                    .Where(video => !accountHistory.ContainsVideo(video.Id) && video.Timestamp > latestTimestamp)
+                    .ToList();
 
-                        return video;
-                    }
+                if (fresh.Count == 0)
+                {
+                    _logger.LogInformation($"   Нет новых видео (последнее: {videoList.First().Id})");
                 }
 
-                _logger.LogInformation($"   Нет новых видео (последнее: {videoList.First().Id})");
-                return null;
+                return (fresh, latestTimestamp);
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, $"   ❌ Ошибка проверки @{username}: {ex.Message}");
                 _logger.LogInformation("   Пропускаем этот аккаунт и продолжаем...");
-                return null;
+                return none;
             }
+        }
+
+        // ─────────────────────────────────────────────────────────────────────
+        //  Ожидание HD-версии
+        // ─────────────────────────────────────────────────────────────────────
+
+        /// <summary>
+        /// Как часто спрашивать TikTok о качестве ждущего ролика. Каждый вопрос —
+        /// это открытие страницы ролика (около 2 секунд и проверка «вы не
+        /// робот»). Без паузы за два часа ожидания при круге в 5–10 минут
+        /// набегало бы по два десятка таких запросов на ролик — лишний повод
+        /// для TikTok заблокировать адрес сервера. HD появляется за десятки
+        /// минут, так что раз в 20 минут почти ничего не теряет.
+        /// </summary>
+        private static readonly TimeSpan HdRecheckInterval = TimeSpan.FromMinutes(20);
+
+        /// <summary>
+        /// Последний ответ TikTok о качестве ждущих роликов: ID → когда спросили и
+        /// что он ответил (null — ответа не было). Только в памяти: после
+        /// перезапуска спросим заново, это один запрос на ролик.
+        /// </summary>
+        private readonly Dictionary<string, (DateTimeOffset At, MediaInfo? Best)> _hdProbes = new();
+
+        public int WaitForHdMinutes => Math.Max(0, _settings.WaitForHdMinutes);
+
+        public async Task<HdCheck> CheckHdAsync(TikTokVideo video)
+        {
+            var wait = WaitForHdMinutes;
+
+            // Время выхода — из ID ролика (см. GetLatestVideosFromEmbed). Его нет —
+            // отсчитывать ожидание не от чего, качаем сразу.
+            if (wait == 0 || video.Timestamp <= 0)
+            {
+                return new HdCheck(true, string.Empty);
+            }
+
+            var now = DateTimeOffset.UtcNow;
+            var ageMinutes = Math.Max(0, (now.ToUnixTimeSeconds() - video.Timestamp) / 60.0);
+
+            // Ответы о роликах, которые так и не дождались своей очереди (автор
+            // удалил ролик, Страницу выключили), не копим.
+            foreach (var stale in _hdProbes.Where(p => now - p.Value.At > TimeSpan.FromDays(1)).Select(p => p.Key).ToList())
+            {
+                _hdProbes.Remove(stale);
+            }
+
+            // Срок вышел — спрашивать незачем: yt-dlp и так скачает лучшее из того, что есть.
+            if (ageMinutes >= wait)
+            {
+                _hdProbes.Remove(video.Id);
+                return new HdCheck(true, $"ролику уже {HdWaitPolicy.Minutes(ageMinutes)} — HD больше не ждём, качаем лучшее, что есть");
+            }
+
+            if (!_hdProbes.TryGetValue(video.Id, out var probe) || now - probe.At >= HdRecheckInterval)
+            {
+                probe = (now, await ProbeBestQualityAsync(video));
+                _hdProbes[video.Id] = probe;
+            }
+
+            // Срок кончится раньше, чем подойдёт время переспросить, — тогда
+            // ролик уйдёт по сроку, и в логе честнее назвать его.
+            var nextCheck = (int)Math.Ceiling(Math.Max(1, Math.Min(
+                (probe.At + HdRecheckInterval - now).TotalMinutes,
+                wait - ageMinutes)));
+            var check = HdWaitPolicy.Decide(probe.Best, ageMinutes, wait, nextCheck);
+
+            if (check.Ready)
+            {
+                _hdProbes.Remove(video.Id);
+            }
+
+            return check;
+        }
+
+        /// <summary>
+        /// Лучший вариант ролика, который TikTok отдаёт прямо сейчас, — без
+        /// скачивания. Тот же выбор, что при скачивании («-S res,br»): yt-dlp
+        /// только печатает, что выбрал бы. null — узнать не вышло.
+        /// </summary>
+        public async Task<MediaInfo?> ProbeBestQualityAsync(TikTokVideo video)
+        {
+            // «--extractor-retries 3» после Reliability перекрывает его 10: у
+            // yt-dlp побеждает последнее значение. Десять повторов с паузами до
+            // 30 секунд оправданы при скачивании, а вопрос о качестве не стоит
+            // нескольких минут круга — не вышло, значит, качаем без ожидания.
+            var args = "--no-playlist -S res,br " +
+                       "--print \"%(width)s|%(height)s|%(fps)s|%(vcodec)s\" " +
+                       Reliability +
+                       "--extractor-retries 3 " +
+                       ExtraArgs() +
+                       $"\"{video.Url}\"";
+
+            try
+            {
+                var output = await RunProcessAsync(_settings.YtDlpPath, args);
+
+                var line = output
+                    .Split('\n')
+                    .Select(l => l.Trim())
+                    .LastOrDefault(l => l.Length > 0) ?? string.Empty;
+
+                var parts = line.Split('|');
+                if (parts.Length >= 4
+                    && int.TryParse(parts[0], out var width) && width > 0
+                    && int.TryParse(parts[1], out var height) && height > 0)
+                {
+                    double.TryParse(parts[2], System.Globalization.NumberStyles.Float,
+                        System.Globalization.CultureInfo.InvariantCulture, out var fps);
+
+                    return new MediaInfo(width, height, fps, parts[3], 0);
+                }
+
+                _logger.LogWarning($"   ⚠️  Не понял ответ yt-dlp о качестве ролика: «{line}»");
+            }
+            catch (Exception ex)
+            {
+                var reason = ex.Message
+                    .Split('\n')
+                    .LastOrDefault(l => !string.IsNullOrWhiteSpace(l))
+                    ?.Trim() ?? ex.Message;
+
+                _logger.LogWarning($"   ⚠️  Не удалось узнать у TikTok качество ролика ({reason})");
+            }
+
+            return null;
         }
 
         public void MarkVideoAsProcessed(string historyKey, string videoId, long timestamp)
@@ -453,12 +632,17 @@ namespace FacebookReelsPublisher.Services
 
             // Два пути, и они дают РАЗНОЕ, поэтому порядок именно такой.
             //
-            // yt-dlp добирается до мастера 1080x1920: у ролика есть отдельные
-            // дорожки bytevc1_1080p (h265, «video only») плюс звук, и «-S res,br»
-            // выбирает их и склеивает. Прямая ссылка из embed — это готовый
-            // muxed-вариант h264_540p, то есть 576x1024. Замер 21.08.2026 на
+            // yt-dlp берёт лучшее из того, что TikTok уже сделал: «-S res,br»
+            // выбирает bytevc1_1080p (h265), если он есть. Прямая ссылка из
+            // embed — всегда h264_540p, то есть 576x1024. Замер 21.08.2026 на
             // четырёх авторах: playAddr всякий раз 576x1024, yt-dlp всякий раз
             // 1080x1920.
+            //
+            // Но у СВЕЖЕГО ролика TikTok и сам хранит только 576x1024: лесенку
+            // HD он достраивает за десятки минут или часы (замер 11–12.10.2026,
+            // см. HdWaitPolicy). Ролик, скачанный в первые минуты, был 576x1024
+            // любым путём, поэтому программа сперва ждёт HD (WaitForHdMinutes),
+            // а уже потом приходит сюда.
             //
             // Для Facebook разница между этими двумя путями серьёзнее, чем была
             // для Instagram. Минимум Reels API — 540x960, а прямая ссылка даёт
@@ -537,7 +721,7 @@ namespace FacebookReelsPublisher.Services
                 throw lastError ?? new Exception($"не удалось скачать {video.Url}");
             }
 
-            _logger.LogWarning("   ⚠️  yt-dlp не справился — берём прямую ссылку из embed (576x1024 вместо 1080x1920)");
+            _logger.LogWarning("   ⚠️  yt-dlp не справился — берём прямую ссылку из embed: она всегда 576x1024, даже если у TikTok уже есть HD");
 
             try
             {

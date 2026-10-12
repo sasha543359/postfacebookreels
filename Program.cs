@@ -117,7 +117,7 @@ namespace FacebookReelsPublisher
                 return;
             }
 
-            DisplaySettings(pages, appSettings, server);
+            DisplaySettings(pages, appSettings, server, tiktokMonitor.WaitForHdMinutes);
 
             var cycleCount = 0;
 
@@ -180,11 +180,10 @@ namespace FacebookReelsPublisher
 
                             try
                             {
-                                var newVideo = await tiktokMonitor.CheckForNewVideo(tiktokUsername, historyKey);
+                                var newVideo = await PickVideoToPublish(tiktokMonitor, tiktokUsername, historyKey);
 
                                 if (newVideo == null)
                                 {
-                                    AnsiConsole.MarkupLine("[grey]   Нет новых видео[/]\n");
                                     await DelayBetweenChecks(pageIndex, pages.Count, tiktokIndex, maxTikTokAccounts, tiktokDelay);
                                     continue;
                                 }
@@ -231,6 +230,50 @@ namespace FacebookReelsPublisher
                     await Task.Delay(TimeSpan.FromMinutes(1));
                 }
             }
+        }
+
+        /// <summary>
+        /// Какой ролик автора публиковать прямо сейчас. null — новых нет или
+        /// очередной ждёт, пока TikTok сделает его HD-версию (что и почему —
+        /// уже напечатано).
+        /// </summary>
+        static async Task<TikTokVideo?> PickVideoToPublish(ITikTokMonitorService monitor, string username, string historyKey)
+        {
+            // Без ожидания HD — ровно как было: самый свежий из новых.
+            if (monitor.WaitForHdMinutes == 0)
+            {
+                var latest = await monitor.CheckForNewVideo(username, historyKey);
+                if (latest == null)
+                {
+                    AnsiConsole.MarkupLine("[grey]   Нет новых видео[/]\n");
+                }
+
+                return latest;
+            }
+
+            var fresh = await monitor.GetNewVideos(username, historyKey);
+            if (fresh.Count == 0)
+            {
+                AnsiConsole.MarkupLine("[grey]   Нет новых видео[/]\n");
+                return null;
+            }
+
+            // Старший из новых, а не самый свежий — почему, сказано у GetNewVideos.
+            var video = fresh[0];
+            var hd = await monitor.CheckHdAsync(video);
+
+            if (!hd.Ready)
+            {
+                AnsiConsole.MarkupLine($"[grey]   ⏳ {Esc(hd.Message)}[/]\n");
+                return null;
+            }
+
+            if (hd.Message.Length > 0)
+            {
+                AnsiConsole.MarkupLine($"[green]   📐 {Esc(hd.Message)}[/]");
+            }
+
+            return video;
         }
 
         static async Task DelayBetweenChecks(int pageIndex, int pageCount, int tiktokIndex, int maxTikTok, int seconds)
@@ -352,6 +395,7 @@ namespace FacebookReelsPublisher
             table.AddColumn("Роликов");
             table.AddColumn("Последний");
             table.AddColumn("Когда (UTC)");
+            table.AddColumn("Качество у TikTok");
             table.AddColumn("Итог");
 
             for (var i = 0; i < targets.Count; i++)
@@ -366,6 +410,20 @@ namespace FacebookReelsPublisher
                 var verdict = newest == null
                     ? "[red]роликов нет[/]"
                     : "[green]лента читается[/]";
+
+                // В каком качестве TikTok отдаёт последний ролик прямо сейчас.
+                // У только что вышедшего это почти всегда 576x1024 — HD TikTok
+                // делает позже, его программа и ждёт (WaitForHdMinutes).
+                var quality = "—";
+                if (newest != null)
+                {
+                    var best = await monitor.ProbeBestQualityAsync(newest);
+                    quality = best == null
+                        ? "[yellow]не узнать[/]"
+                        : $"{best.Width}×{best.Height}" + (best.ShortSide >= HdWaitPolicy.FullHdSide
+                            ? string.Empty
+                            : best.ShortSide >= HdWaitPolicy.HdSide ? " [grey](1080p нет)[/]" : " [grey](HD ещё нет)[/]");
+                }
 
                 if (newest != null && download)
                 {
@@ -388,6 +446,7 @@ namespace FacebookReelsPublisher
                     newest == null
                         ? "—"
                         : DateTimeOffset.FromUnixTimeSeconds(newest.Timestamp).UtcDateTime.ToString("dd.MM HH:mm"),
+                    quality,
                     verdict);
 
                 if (i < targets.Count - 1)
@@ -401,6 +460,11 @@ namespace FacebookReelsPublisher
             AnsiConsole.MarkupLine(
                 "\n[grey]«роликов нет» рядом с живым аккаунтом означает капчу или блокировку адреса;" +
                 " если выше стоит ⛔ — такого ника у TikTok нет, и правится это только в appsettings.json[/]");
+
+            var wait = monitor.WaitForHdMinutes;
+            AnsiConsole.MarkupLine(wait > 0
+                ? $"[grey]«HD ещё нет» у свежего ролика — норма: TikTok делает HD позже. Программа ждёт его до {HdWaitPolicy.Minutes(wait)} (WaitForHdMinutes)[/]"
+                : "[yellow]Ожидание HD выключено (WaitForHdMinutes: 0): свежие ролики уйдут в Facebook из исходника 576×1024, растянутого до 1080×1920, — заметно мыльнее настоящего 1080p[/]");
         }
 
         // ─────────────────────────────────────────────────────────────────────
@@ -597,6 +661,15 @@ namespace FacebookReelsPublisher
                             localPath = await tiktokMonitor.DownloadVideo(newVideo);
                         }
 
+                        // В каком виде ролик пришёл. Без этой строчки по логу не
+                        // понять жалобу «Facebook пишет, что разрешение низкое»:
+                        // свежий ролик TikTok отдаёт в 576x1024 (см. HdWaitPolicy).
+                        var sourceInfo = await MediaProbe.ProbeAsync(localPath);
+                        if (sourceInfo != null)
+                        {
+                            AnsiConsole.MarkupLine($"[grey]   📐 Исходник:[/] {Esc(sourceInfo.Describe())}");
+                        }
+
                         // УНИКАЛИЗАЦИЯ (если включена). При любом сбое сервис
                         // возвращает исходник — публикация не ломается.
                         if (uniquifier.Enabled)
@@ -623,9 +696,17 @@ namespace FacebookReelsPublisher
                         ctx.Status("✂️ Проверяем длительность...");
                         localPath = await uniquifier.EnsureReelsDurationAsync(localPath);
 
+                        // Разрешение — тоже ВСЕГДА и после подрезки (растягивать
+                        // лишние секунды незачем). Меньше 1080x1920 сюда приходит,
+                        // когда уникализатор выключен, упал или не успел.
+                        ctx.Status("📐 Проверяем разрешение...");
+                        localPath = await uniquifier.EnsureReelsResolutionAsync(localPath);
+
+                        var finalInfo = await MediaProbe.ProbeAsync(localPath);
                         var fileSize = new FileInfo(localPath).Length / 1024.0 / 1024.0;
                         AnsiConsole.MarkupLine($"[green]✓[/] Видео готово: [grey]{Esc(Path.GetFileName(localPath))}[/]");
-                        AnsiConsole.MarkupLine($"[grey]   Размер:[/] {fileSize:F2} МБ");
+                        AnsiConsole.MarkupLine($"[grey]   Размер:[/] {fileSize:F2} МБ" +
+                                               (finalInfo != null ? $"[grey], [/]{Esc(finalInfo.Describe())}" : string.Empty));
 
                         // Публичная ссылка нужна только режимам "url" и "auto".
                         // В режиме "bytes" её может не быть вовсе — тогда файл
@@ -836,7 +917,7 @@ namespace FacebookReelsPublisher
         //  Вывод настроек
         // ─────────────────────────────────────────────────────────────────────
 
-        static void DisplaySettings(List<FacebookPageSettings> pages, AppSettings appSettings, ServerSettings server)
+        static void DisplaySettings(List<FacebookPageSettings> pages, AppSettings appSettings, ServerSettings server, int waitForHdMinutes)
         {
             var pagesTable = new Table().Border(TableBorder.Rounded);
             pagesTable.AddColumn("[yellow]Страница Facebook[/]");
@@ -870,6 +951,9 @@ namespace FacebookReelsPublisher
             {
                 configTable.AddRow($"#️⃣  Хэштеги {Esc(page.PageName)}", Esc(page.DefaultHashtags!));
             }
+            configTable.AddRow("📐 Ждать HD-версию у TikTok", waitForHdMinutes > 0
+                ? $"до {HdWaitPolicy.Minutes(waitForHdMinutes)} после выхода ролика"
+                : "не ждём — исходник обычно 576×1024, растягиваем до 1080×1920");
             configTable.AddRow("🚦 Лимит на Страницу за 24ч", $"{appSettings.Publishing.MaxPostsPerPagePerDay} (потолок Facebook: {appSettings.Publishing.ApiHardLimitPer24h})");
             configTable.AddRow("💾 История", "Последние 5 видео с timestamp");
 

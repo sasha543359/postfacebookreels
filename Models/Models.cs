@@ -188,8 +188,11 @@ namespace FacebookReelsPublisher.Models
         /// <summary>TTF со шрифтом с кириллицей (для --caption). На Linux-контейнере — DejaVu.</summary>
         public string Font { get; set; } = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf";
 
-        /// <summary>Таймаут на обработку одного видео, секунды.</summary>
-        public int TimeoutSeconds { get; set; } = 180;
+        /// <summary>
+        /// Таймаут на обработку одного видео, секунды. uniquify.py получает его
+        /// как --budget и подбирает под него пресет x264.
+        /// </summary>
+        public int TimeoutSeconds { get; set; } = 300;
     }
 
     public class ServerSettings
@@ -270,6 +273,15 @@ namespace FacebookReelsPublisher.Models
         /// вместо страницы.
         /// </summary>
         public string Impersonate { get; set; } = string.Empty;
+
+        /// <summary>
+        /// Сколько минут после выхода ролика ждать, пока TikTok сделает его
+        /// HD-версию, прежде чем публиковать. 0 — не ждать (как было до
+        /// 12.10.2026: публиковать сразу, почти всегда в 576x1024).
+        /// Почему и как ждём — HdWaitPolicy. 120 — в замере 11–12.10.2026 все
+        /// случаи, когда 1080p появился на глазах, уложились в первые 2 часа.
+        /// </summary>
+        public int WaitForHdMinutes { get; set; } = 120;
     }
 
     /// <summary>Результат публикации Reels.</summary>
