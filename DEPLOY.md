@@ -193,21 +193,28 @@ docker compose up -d --build
 ## Обновить код
 
 Сервер поставлен через git (`setup.sh` или ИНСТРУКЦИЯ.pdf), поэтому обновление —
-`git pull`. Свои настройки перед этим отложи: шаблон `appsettings.json` в
-GitHub тоже меняется.
+`git pull`. Два своих файла перед этим отложи и потом верни: `appsettings.json`
+(твои настройки — шаблон в GitHub тоже меняется) и `docker-compose.yml`.
 
 ```bash
 cd /opt/facebook-reels-publisher
-cp appsettings.json /root/appsettings.my.json   # свои настройки — в сторону
-git checkout -- .                                # убрать ручные правки в файлах программы
+cp appsettings.json /root/appsettings.my.json       # свои настройки — в сторону
+cp docker-compose.yml /root/docker-compose.my.yml   # серверный compose — тоже
+git checkout -- .                                    # убрать ручные правки в файлах программы
 git pull
-cp /root/appsettings.my.json appsettings.json   # настройки — обратно
+cp /root/appsettings.my.json appsettings.json       # настройки — обратно
+cp /root/docker-compose.my.yml docker-compose.yml   # compose — обратно
 docker compose up -d --build
 ```
 
+> `docker-compose.yml` на сервере не тот, что в GitHub: `setup.sh` при установке
+> записал свой — только программа и папка `/var/www/videos` с хоста. В GitHub
+> лежит вариант со встроенным Nginx: вернись он на сервер — программа не
+> поднимется (порт 80 уже занят) и не увидит папку с историей и счётчиком.
+> Поэтому его откладываем вместе с настройками.
+>
 > `git checkout -- .` стирает ручные правки в файлах программы (например, в
-> `uniquify.py`) — их место займёт версия из GitHub. Менял `docker-compose.yml` —
-> отложи и его так же, как `appsettings.json`.
+> `uniquify.py`) — их место займёт версия из GitHub.
 
 **После обновления 12.10.2026** поправь в своём `appsettings.json` одно
 значение: в блоке `Uniquifier` — `"TimeoutSeconds": 300` (было 180). Программа
